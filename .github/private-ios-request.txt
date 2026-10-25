@@ -1,2 +1,2 @@
-Public runner / private IO request 2026-10-24 - v0.26.0 build 33; owner authorized GitHub compilation after five source development rounds. GPUVS startup policy, loading/upload work, guest scheduling and PCM publication changes; native compilation and device performance remain unverified at request time.
+Public runner / private IO request 2026-10-25 - v0.26.1 build 34; targeted startup-regression correction. Guest handoff cadence survives lifecycle reacquisition; v0.25 periodic host scheduler yield restored. Source reviewed after the owner's v0.26 black-screen log; device startup recovery remains unverified.
 Owner-reviewed environment required.

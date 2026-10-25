@@ -440,10 +440,17 @@ static int guest_handoff_deadline(struct timespec *deadline){
 }
 
 static void guest_poll_handoff(void){
-    if (!tl_guest_owned || tl_cs_depth || !tl_gil_t0 ||
+    /* Cadence must survive ordinary unlock/relock and lifecycle checkpoints.
+     * gil_took() resets the ownership-duration clock at each acquisition. A
+     * fast 1024-import loop can therefore keep that clock below 2 ms forever,
+     * even while peers remain queued. The first eligible queued poll yields
+     * promptly; subsequent attempts are throttled from their own completion. */
+    static _Thread_local uint64_t last_handoff_us;
+    if (!tl_guest_owned || tl_cs_depth ||
         !__atomic_load_n(&g_guest_waiters, __ATOMIC_RELAXED)) return;
     uint64_t now = gil_now_us();
-    if (now < tl_gil_t0 || now - tl_gil_t0 < 2000ull) return;
+    if (!now || (last_handoff_us && now >= last_handoff_us &&
+                 now - last_handoff_us < 2000ull)) return;
     struct timespec deadline;
     if (!guest_handoff_deadline(&deadline)) return;
     uint64_t generation = g_guest_generation;
@@ -471,6 +478,7 @@ static void guest_poll_handoff(void){
      * the wait predicate has been decided. It cannot satisfy its own handoff. */
     guest_record_acquisition(started);
     gil_took();
+    last_handoff_us = gil_now_us();
     if (transferred)
         __atomic_fetch_add(&g_guest_fair_handoffs, 1ull, __ATOMIC_RELAXED);
 }
@@ -636,10 +644,11 @@ void guest_fair_yield(void){
 #if NFS_FULL_RUNTIME && TARGET_OS_IPHONE
     static _Thread_local uint32_t polls = 0;
     ++polls;
-    /* Keep lifecycle progress even in import-only loops with no queued worker.
-     * The old yield path checked pause every 1024 imports outside the GIL. */
+    /* Keep the v25 host-scheduler yield as well as lifecycle progress at this
+     * boundary. Handoff cadence above is independent of this reacquisition. */
     if ((polls & 0x3FFu) == 0 && tl_guest_owned && !tl_cs_depth){
         guest_yield_begin();
+        sched_yield();
         nfs_game_session_checkpoint();
         guest_yield_end();
     }
