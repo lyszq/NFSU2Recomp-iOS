@@ -1,2 +1,2 @@
-Public runner / private IO request 2026-10-25 - v0.27.0 build 35; clean HUD, Settings sheet, DS4 CoreHaptics & controller config, Rachel/FEng input & DirectInput fixes, 48kHz audio alignment & loading stall guard, native iPad resolution + full LOD defaults, and runtime hot-path optimizations.
+Public runner / private IO request 2026-10-25 - v0.27.0 build 35 (rev 2); non-optional CHHapticEngine stoppedHandler/resetHandler closure cleanup in ControllerSettings.swift.
 Owner-reviewed environment required.

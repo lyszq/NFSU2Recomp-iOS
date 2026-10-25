@@ -138,8 +138,8 @@ private final class ControllerHaptics {
     private func releaseEngine() {
         try? player?.stop(atTime: CHHapticTimeImmediate)
         player = nil
-        engine?.stoppedHandler = nil
-        engine?.resetHandler = nil
+        engine?.stoppedHandler = { _ in }
+        engine?.resetHandler = {}
         engine?.stop(completionHandler: nil)
         engine = nil
     }
