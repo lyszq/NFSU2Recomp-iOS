@@ -67,7 +67,12 @@ typedef struct {
     unsigned char s_def[4];    /* sabit def'li mi (p->def kullan)      */
     unsigned char s_sw[4][4];
     unsigned char s_swk[4];    /* 0=birebir(.xyzw) 1=tek bilesen 2=genel */
+    unsigned char s_neg[4];    /* 1=SMOD 1 (negatif), 0=duz              */
     short         d_num;
+    unsigned char d_type;      /* R_TEMP, R_RASTOUT, R_ATTROUT, R_OUTPUT, R_ADDR */
+    unsigned char d_mask;      /* WMASK */
+    unsigned char d_satur;     /* SATUR */
+    signed char   d_shift;     /* DSHIFT */
 } VSIns;
 
 struct VSProg {
@@ -82,6 +87,16 @@ struct VSProg {
     int       smptype[16];      /* s# doku tipi: 2=2D 3=CUBE 4=VOLUME, 0=bildirilmemis */
     int       maxreg;           /* kullanilan en yuksek gecici yazmac (r#) */
     unsigned  unknown;
+    /* Onceden hesaplanmis ve onbelleklenmis sorgu alanlari (hizli O(1) erisim) */
+    int8_t    inmap_lut[16][8]; /* usage (0..15) x index (0..7) -> v# (yoksa -1) */
+    int16_t   kmax;             /* vs_kmax sonucu */
+    int8_t    pos_cx;           /* vs_pos_creg cx */
+    int8_t    pos_cw;           /* vs_pos_creg cw */
+    int8_t    fog_creg;         /* vs_fog_creg sonucu */
+    int8_t    writes_fog;       /* vs_writes_fog sonucu */
+    int8_t    uses_colorout;    /* ps_uses_colorout sonucu */
+    int16_t   light_creg;       /* vs_light_creg sonucu */
+    float     light_ramp[2];    /* vs_light_creg ramp degerleri */
 };
 
 static int is_param(uint32_t t){ return (t & 0x80000000u) != 0; }
@@ -100,6 +115,7 @@ VSProg *vs_compile(const uint32_t *tok, size_t max_dw){
     p->version = ver & 0xFFFFu;
     p->is_ps = ((ver >> 16) == 0xFFFFu);
     for (int i = 0; i < 16; i++){ p->inmap[i][0] = -1; p->inmap[i][1] = 0; p->smptype[i] = 0; }
+    memset(p->inmap_lut, 0xFF, sizeof p->inmap_lut);
 
     unsigned cap = 64;
     p->ins = malloc(cap * sizeof(VSIns));
@@ -154,8 +170,12 @@ VSProg *vs_compile(const uint32_t *tok, size_t max_dw){
             if (RT(ix->dst) == R_INPUT){
                 int rn = RN(ix->dst);
                 if (rn >= 0 && rn < 16){
-                    p->inmap[rn][0] = (int)(ut & 0x1Fu);
-                    p->inmap[rn][1] = (int)((ut & 0x000F0000u) >> 16);
+                    int u = (int)(ut & 0x1Fu);
+                    int ui = (int)((ut & 0x000F0000u) >> 16);
+                    p->inmap[rn][0] = u;
+                    p->inmap[rn][1] = ui;
+                    if ((unsigned)u < 16u && (unsigned)ui < 8u)
+                        p->inmap_lut[u][ui] = (int8_t)rn;
                 }
             }
             /* ps_2_0: `dcl_2d s0` / `dcl_cube s1` -- doku TIPI *DCL
@@ -218,6 +238,14 @@ VSProg *vs_compile(const uint32_t *tok, size_t max_dw){
                 else p->ins[o].match2 = (int)k;
                 p->ins[k].match = o;
             }
+        } else if (op == O_CALL || op == O_CALLNZ){
+            int want = RN(p->ins[k].src[0]);
+            for (unsigned q = 0; q < p->n; q++){
+                if (p->ins[q].op == O_LABEL && RN(p->ins[q].src[0]) == want){
+                    p->ins[k].match = (int)q;
+                    break;
+                }
+            }
         }
     }
     /* Kose basina yalnizca kullanilan yazmaclari temizleyebilmek icin
@@ -228,7 +256,8 @@ VSProg *vs_compile(const uint32_t *tok, size_t max_dw){
         for (unsigned t = 0; t < x->nsrc && t < 4; t++){
             unsigned tok = x->src[t];
             int ty = RT(tok), nu = RN(tok);
-            if (RELADDR(tok) || SMOD(tok) != 0u){ x->fsrc = 0; break; }
+            unsigned sm = SMOD(tok);
+            if (RELADDR(tok) || (sm != 0u && sm != 1u)){ x->fsrc = 0; break; }
             if (ty == R_CONST2) nu += 2048; else if (ty == R_CONST3) nu += 4096;
             else if (ty == R_CONST4) nu += 6144;
             if (ty == R_CONST2 || ty == R_CONST3 || ty == R_CONST4) ty = R_CONST;
@@ -238,6 +267,7 @@ VSProg *vs_compile(const uint32_t *tok, size_t max_dw){
             else { x->fsrc = 0; break; }
             x->s_type[t] = (signed char)ty;
             x->s_num[t]  = (short)nu;
+            x->s_neg[t]  = (sm == 1u) ? 1u : 0u;
             x->s_def[t]  = (ty == R_CONST &&
                             (p->defmask[nu >> 5] & (1u << (nu & 31)))) ? 1u : 0u;
             unsigned sw = SWIZ(tok);
@@ -250,10 +280,18 @@ VSProg *vs_compile(const uint32_t *tok, size_t max_dw){
                      x->s_sw[t][2]==x->s_sw[t][3]) x->s_swk[t] = 1u;
             else x->s_swk[t] = 2u;
         }
-        if (x->has_dst && RT(x->dst) == R_TEMP && WMASK(x->dst) == 0xFu &&
-            !SATUR(x->dst) && !RELADDR(x->dst)){
+        if (x->has_dst){
+            int dt = RT(x->dst);
             int dn = RN(x->dst);
-            if (dn >= 0 && dn < 32){ x->fdst = 1; x->d_num = (short)dn; }
+            unsigned m = WMASK(x->dst);
+            x->d_type = (unsigned char)dt;
+            x->d_num  = (short)dn;
+            x->d_mask = (unsigned char)m;
+            x->d_satur= (unsigned char)(SATUR(x->dst) ? 1 : 0);
+            x->d_shift= (signed char)(p->is_ps ? DSHIFT(x->dst) : 0);
+            if (dt == R_TEMP && m == 0xFu && !x->d_satur && !RELADDR(x->dst) && dn >= 0 && dn < 32){
+                x->fdst = 1;
+            }
         }
     }
     { int mr = -1;
@@ -267,19 +305,188 @@ VSProg *vs_compile(const uint32_t *tok, size_t max_dw){
       }
       if (mr > 31) mr = 31;
       p->maxreg = mr; }
+
+    /* Onceden hesaplanmis sorgular: cizim sirasinda tekrarlanan taramalari onler */
+    {
+        /* 1) kmax */
+        int mx = -1;
+        for (unsigned q = 0; q < p->n; q++){
+            const VSIns *x = &p->ins[q];
+            int rows = 1;
+            if (x->op==O_M4x4 || x->op==O_M3x4) rows = 4;
+            else if (x->op==O_M4x3 || x->op==O_M3x3) rows = 3;
+            else if (x->op==O_M3x2) rows = 2;
+            for (unsigned t = 0; t < x->nsrc; t++){
+                unsigned tok = x->src[t];
+                int ty = RT(tok);
+                if (ty != R_CONST && ty != R_CONST2 && ty != R_CONST3 && ty != R_CONST4)
+                    continue;
+                if (RELADDR(tok)){ mx = 255; break; }
+                int idx = RN(tok);
+                if (ty == R_CONST2) idx += 2048; else if (ty == R_CONST3) idx += 4096;
+                else if (ty == R_CONST4) idx += 6144;
+                if (idx < 0 || idx > 255){ mx = 255; break; }
+                int top = idx + ((t == 1) ? rows - 1 : 0);
+                if (top > mx) mx = top;
+            }
+            if (mx >= 255) break;
+        }
+        if (mx < 0) mx = 0;
+        if (mx > 255) mx = 255;
+        p->kmax = (int16_t)(mx + 1);
+
+        /* 2) writes_fog */
+        p->writes_fog = 0;
+        for (unsigned q = 0; q < p->n; q++){
+            const VSIns *x = &p->ins[q];
+            if (x->has_dst && RT(x->dst) == R_RASTOUT && RN(x->dst) == 1){
+                p->writes_fog = 1;
+                break;
+            }
+        }
+
+        /* 3) pos_cx, pos_cw */
+        int cx = -1, cw = -1;
+        int16_t tsrc[32][4];
+        memset(tsrc, 0xFF, sizeof tsrc);
+        for (unsigned q = 0; q < p->n; q++){
+            const VSIns *x = &p->ins[q];
+            if (!x->has_dst) continue;
+            unsigned m = WMASK(x->dst); if (!m) m = 0xFu;
+            if (RT(x->dst) == R_TEMP && RN(x->dst) < 32){
+                int k2 = -1;
+                if (x->op == O_DP4 && x->nsrc >= 2 && RT(x->src[1]) == R_CONST && !RELADDR(x->src[1]) &&
+                    RT(x->src[0]) == R_INPUT)
+                    k2 = RN(x->src[1]);
+                for (int c = 0; c < 4; c++) if (m & (1u << c)) tsrc[RN(x->dst)][c] = (int16_t)k2;
+                continue;
+            }
+            if (RT(x->dst) != R_RASTOUT || RN(x->dst) != 0) continue;
+            if (x->op == O_M4x4 || x->op == O_M4x3){
+                if (x->nsrc >= 2 && RT(x->src[1]) == R_CONST && !RELADDR(x->src[1])){
+                    cx = RN(x->src[1]); cw = cx + 3;
+                }
+            } else if (x->op == O_DP4 && x->nsrc >= 2 &&
+                       RT(x->src[1]) == R_CONST && !RELADDR(x->src[1])){
+                if (m & 1u) cx = RN(x->src[1]);
+                if (m & 8u) cw = RN(x->src[1]);
+            } else if (x->op == O_MOV && x->nsrc >= 1 && RT(x->src[0]) == R_TEMP &&
+                       RN(x->src[0]) < 32 && SMOD(x->src[0]) == 0u){
+                for (int c = 0; c < 4; c += 3){
+                    if (!(m & (1u << c))) continue;
+                    int sc = (int)((SWIZ(x->src[0]) >> (2 * c)) & 3u);
+                    int k2 = tsrc[RN(x->src[0])][sc];
+                    if (k2 >= 0){ if (c == 0) cx = k2; else cw = k2; }
+                }
+            }
+        }
+        p->pos_cx = (int8_t)cx;
+        p->pos_cw = (int8_t)cw;
+
+        /* 4) fog_creg */
+        int fk = -1;
+        for (unsigned q = 0; q < p->n; q++){
+            const VSIns *x = &p->ins[q];
+            if (!x->has_dst || x->op != O_MAX || x->nsrc < 2) continue;
+            if (RT(x->dst) != R_TEMP || RT(x->src[1]) != R_CONST || RELADDR(x->src[1])) continue;
+            if (((SWIZ(x->src[1])) & 3u) != 2u) continue;
+            fk = RN(x->src[1]);
+        }
+        p->fog_creg = (int8_t)((fk >= 0 && p->writes_fog) ? fk : -1);
+
+        /* 5) light_creg and light_ramp */
+        int pr = -1;
+        for (int i = 0; i < 16; i++){
+            if (p->inmap[i][0] == 0 && p->inmap[i][1] == 0){ pr = i; break; }
+        }
+        int lk[3] = { -1, -1, -1 };
+        for (unsigned q = 0; q < p->n; q++){
+            const VSIns *x = &p->ins[q];
+            if (!x->has_dst || x->op != O_DP4 || x->nsrc < 2) continue;
+            if (RT(x->dst) != R_OUTPUT || RN(x->dst) != 1) continue;
+            if (RT(x->src[0]) != R_INPUT || RN(x->src[0]) != pr) continue;
+            if (RT(x->src[1]) != R_CONST || RELADDR(x->src[1])) continue;
+            unsigned m = WMASK(x->dst);
+            if (m == 1u) lk[0] = RN(x->src[1]);
+            else if (m == 2u) lk[1] = RN(x->src[1]);
+            else if (m == 4u) lk[2] = RN(x->src[1]);
+        }
+        if (lk[0] < 0 || lk[1] != lk[0] + 1 || lk[2] != lk[0] + 2 || lk[0] + 3 > 255){
+            p->light_creg = -1;
+            p->light_ramp[0] = 0.005f;
+            p->light_ramp[1] = 0.5f;
+        } else {
+            p->light_creg = (int16_t)lk[0];
+            p->light_ramp[0] = 0.005f;
+            p->light_ramp[1] = 0.5f;
+            for (unsigned q = 0; q < p->n; q++){
+                const VSIns *x = &p->ins[q];
+                if (!x->has_dst || x->op != O_MAD || x->nsrc < 3) continue;
+                if (RT(x->dst) != R_OUTPUT || RN(x->dst) != 2 || !(WMASK(x->dst) & 1u)) continue;
+                if (RT(x->src[1]) != R_CONST || RT(x->src[2]) != R_CONST) continue;
+                int a = RN(x->src[1]), b = RN(x->src[2]);
+                if (a > 255 || b > 255) continue;
+                if (!(p->defmask[a >> 5] & (1u << (a & 31))) || !(p->defmask[b >> 5] & (1u << (b & 31)))) continue;
+                p->light_ramp[0] = p->def[a][SWIZ(x->src[1]) & 3u];
+                p->light_ramp[1] = p->def[b][SWIZ(x->src[2]) & 3u];
+            }
+        }
+
+        /* 6) uses_colorout */
+        p->uses_colorout = 0;
+        for (unsigned q = 0; q < p->n; q++){
+            if (p->ins[q].has_dst && RT(p->ins[q].dst) == R_COLOROUT){
+                p->uses_colorout = 1;
+                break;
+            }
+        }
+    }
     return p;
 }
 
-void vs_free(VSProg *p){ if (p){ free(p->ins); free(p); } }
+/* 1-entry MRU cache for vs_input_reg / vs_find */
+static const VSProg *s_last_prog = NULL;
+static int s_last_usage = -1;
+static int s_last_uindex = -1;
+static int s_last_reg = -1;
+
+void vs_free(VSProg *p){
+    if (p){
+        if (s_last_prog == p) s_last_prog = NULL;
+        free(p->ins);
+        free(p);
+    }
+}
 unsigned vs_version(const VSProg *p){ return p ? p->version : 0; }
 unsigned vs_ninstr(const VSProg *p){ return p ? p->n : 0; }
 unsigned vs_unknown(const VSProg *p){ return p ? p->unknown : 0; }
 
 int vs_input_reg(const VSProg *p, int usage, int usage_index){
     if (!p) return -1;
-    for (int i = 0; i < 16; i++)
-        if (p->inmap[i][0] == usage && p->inmap[i][1] == usage_index) return i;
-    return -1;
+    if (p == s_last_prog && usage == s_last_usage && usage_index == s_last_uindex)
+        return s_last_reg;
+
+    int r;
+    if ((unsigned)usage < 16u && (unsigned)usage_index < 8u){
+        r = p->inmap_lut[usage][usage_index];
+    } else {
+        r = -1;
+        for (int i = 0; i < 16; i++){
+            if (p->inmap[i][0] == usage && p->inmap[i][1] == usage_index){
+                r = i;
+                break;
+            }
+        }
+    }
+    s_last_prog = p;
+    s_last_usage = usage;
+    s_last_uindex = usage_index;
+    s_last_reg = r;
+    return r;
+}
+
+int vs_find(const VSProg *p, int usage, int usage_index){
+    return vs_input_reg(p, usage, usage_index);
 }
 
 /* ---- yurutme ---- */
@@ -386,6 +593,61 @@ static void dst_write(Exec *e, unsigned tok, const float val[4]){
     for (int i = 0; i < 4; i++) if (mask & (1u << i)) d[i] = v[i];
 }
 
+static inline void dst_write_ins(Exec *e, const VSIns *x, const float val[4]){
+    float v[4]; memcpy(v, val, 16);
+    if (x->d_shift){
+        float k = ldexpf(1.f, x->d_shift);
+        for (int i = 0; i < 4; i++) v[i] *= k;
+    }
+    if (x->d_satur){
+        for (int i = 0; i < 4; i++)
+            v[i] = v[i] < 0.f ? 0.f : (v[i] > 1.f ? 1.f : v[i]);
+    }
+    float *d = 0;
+    unsigned mask = x->d_mask;
+    switch (x->d_type){
+    case R_TEMP:
+        if (x->d_num >= 0 && x->d_num < 32){
+            if (mask == 0xFu){ memcpy(e->r[x->d_num], v, 16); return; }
+            d = e->r[x->d_num];
+        }
+        break;
+    case R_RASTOUT:
+        if (x->d_num == 0){
+            if (mask == 0xFu){ memcpy(e->o->pos, v, 16); return; }
+            d = e->o->pos;
+        } else if (x->d_num == 1){
+            if (mask & 1) e->o->fog = v[0];
+            return;
+        } else if (x->d_num == 2){
+            if (mask & 1) e->o->psize = v[0];
+            return;
+        }
+        break;
+    case R_ATTROUT:
+        if (x->d_num >= 0 && x->d_num < 2){
+            if (mask == 0xFu){ memcpy(e->o->col[x->d_num], v, 16); return; }
+            d = e->o->col[x->d_num];
+        }
+        break;
+    case R_OUTPUT:
+        if (x->d_num >= 0 && x->d_num < 8){
+            if (mask == 0xFu){ memcpy(e->o->tex[x->d_num], v, 16); return; }
+            d = e->o->tex[x->d_num];
+        }
+        break;
+    case R_ADDR:
+        for (int i = 0; i < 4; i++)
+            if (mask & (1u << i))
+                e->a0[i] = (int)lrintf(v[i]);
+        return;
+    default:
+        return;
+    }
+    if (!d) return;
+    for (int i = 0; i < 4; i++) if (mask & (1u << i)) d[i] = v[i];
+}
+
 static float safe_rcp(float x){ return (x == 0.f) ? 3.402823466e38f : 1.f/x; }
 static float safe_rsq(float x){ x = fabsf(x); return (x == 0.f) ? 3.402823466e38f : 1.f/sqrtf(x); }
 
@@ -421,7 +683,7 @@ int vs_run(const VSProg *p, const VSConst *k, const float v[16][4], VSOut *o){
         const VSIns *x = &p->ins[pc];
         float s[4][4];
 #define DSTW(_x,_d) do{ if ((_x)->fdst) memcpy(e.r[(_x)->d_num],(_d),16); \
-                        else dst_write(&e,(_x)->dst,(_d)); }while(0)
+                        else dst_write_ins(&e,(_x),(_d)); }while(0)
         if (x->fsrc){
             for (unsigned i = 0; i < x->nsrc; i++){
                 const float *b;
@@ -439,6 +701,10 @@ int vs_run(const VSProg *p, const VSConst *k, const float v[16][4], VSOut *o){
                     const unsigned char *sw = x->s_sw[i];
                     s[i][0]=b[sw[0]]; s[i][1]=b[sw[1]];
                     s[i][2]=b[sw[2]]; s[i][3]=b[sw[3]];
+                }
+                if (x->s_neg[i]){
+                    s[i][0] = -s[i][0]; s[i][1] = -s[i][1];
+                    s[i][2] = -s[i][2]; s[i][3] = -s[i][3];
                 }
             }
         } else
@@ -516,14 +782,24 @@ int vs_run(const VSProg *p, const VSConst *k, const float v[16][4], VSOut *o){
                        (x->op==O_M4x3||x->op==O_M3x3) ? 3 : 2;
             int cols = (x->op==O_M4x4||x->op==O_M4x3) ? 4 : 3;
             unsigned base = x->src[1];
+            int is_c = (!RELADDR(base) && !x->rel[1] && RT(base) == R_CONST);
+            int base_rn = RN(base);
             for (int rw = 0; rw < rows; rw++){
-                unsigned t2 = (base & ~0x7FFu) | ((RN(base) + rw) & 0x7FFu);
-                float m[4]; src_read(&e, t2, x->rel[1], m);
+                float m[4];
+                if (is_c){
+                    int crn = base_rn + rw;
+                    const float *cp = (crn >= 0 && crn < 256) ?
+                        ((p->defmask[crn >> 5] & (1u << (crn & 31))) ? p->def[crn] : k->f[crn]) : ZERO4;
+                    memcpy(m, cp, 16);
+                } else {
+                    unsigned t2 = (base & ~0x7FFu) | ((base_rn + rw) & 0x7FFu);
+                    src_read(&e, t2, x->rel[1], m);
+                }
                 float acc = 0.f;
                 for (int cc = 0; cc < cols; cc++) acc += s[0][cc]*m[cc];
                 d[rw] = acc;
             }
-            dst_write(&e, x->dst, d);
+            DSTW(x, d);
         } break;
         case O_IF:  if (!(s[0][0] != 0.f)){ pc = (x->match >= 0) ? (unsigned)x->match : pc; } break;
         case O_IFC: if (!cmp_ok(x->cmp, s[0][0], s[1][0])){ pc = (x->match >= 0) ? (unsigned)x->match : pc; } break;
@@ -558,10 +834,12 @@ int vs_run(const VSProg *p, const VSConst *k, const float v[16][4], VSOut *o){
                         lsp--; } break;
         case O_CALL: case O_CALLNZ: {
             if (x->op == O_CALLNZ && s[1][0] == 0.f) break;
-            int target = -1;
-            int want = RN(x->src[0]);
-            for (unsigned q = 0; q < p->n; q++)
-                if (p->ins[q].op == O_LABEL && RN(p->ins[q].src[0]) == want){ target=(int)q; break; }
+            int target = x->match;
+            if (target < 0){
+                int want = RN(x->src[0]);
+                for (unsigned q = 0; q < p->n; q++)
+                    if (p->ins[q].op == O_LABEL && RN(p->ins[q].src[0]) == want){ target=(int)q; break; }
+            }
             if (target >= 0 && rsp < 16){ retstack[rsp++] = (int)pc; pc = (unsigned)target; }
         } break;
         case O_RET: if (rsp > 0) pc = (unsigned)retstack[--rsp]; else pc = p->n; break;
@@ -811,7 +1089,12 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
 
     { int anycube = 0;
       for (int q = 0; q < 4; q++) if (p->smptype[q] == 3) anycube = 1;
-      if (anycube || getenv("SMPTYPE")){
+      static int s_smptype_env = -1;
+      if (s_smptype_env < 0){
+          const char *e = getenv("SMPTYPE");
+          s_smptype_env = (e && *e != '0') ? 1 : (e ? 1 : 0);
+      }
+      if (anycube || s_smptype_env){
           fprintf(stderr, "  [ps%d] ornekleyici tipleri: s0=%d s1=%d s2=%d s3=%d%s\n",
                   id, p->smptype[0], p->smptype[1], p->smptype[2], p->smptype[3],
                   anycube ? "   <- KUP VAR" : "");
@@ -1078,10 +1361,7 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
 
 /* Gölgelendirici oC0'a mi yaziyor (ps_2_0) yoksa r0'a mi (ps_1_x)? */
 int ps_uses_colorout(const VSProg *p){
-    if (!p) return 0;
-    for (unsigned q = 0; q < p->n; q++)
-        if (p->ins[q].has_dst && RT(p->ins[q].dst) == R_COLOROUT) return 1;
-    return 0;
+    return p ? (int)p->uses_colorout : 0;
 }
 
 /* ====================================================================
@@ -1149,31 +1429,7 @@ static int vs_dst_msl(char *o, size_t cap, unsigned tok){
  * tamponunu cizim basina 4 KB yerine yalnizca gerektigi kadar
  * yuklemek icin.  Goreli adresleme varsa sinir bilinemez -> 256. */
 int vs_kmax(const VSProg *p){
-    if (!p) return 0;
-    int mx = -1;
-    for (unsigned q = 0; q < p->n; q++){
-        const VSIns *x = &p->ins[q];
-        int rows = 1;
-        if (x->op==O_M4x4 || x->op==O_M3x4) rows = 4;
-        else if (x->op==O_M4x3 || x->op==O_M3x3) rows = 3;
-        else if (x->op==O_M3x2) rows = 2;
-        for (unsigned t = 0; t < x->nsrc; t++){
-            unsigned tok = x->src[t];
-            int ty = RT(tok);
-            if (ty != R_CONST && ty != R_CONST2 && ty != R_CONST3 && ty != R_CONST4)
-                continue;
-            if (RELADDR(tok)) return 256;
-            int idx = RN(tok);
-            if (ty == R_CONST2) idx += 2048; else if (ty == R_CONST3) idx += 4096;
-            else if (ty == R_CONST4) idx += 6144;
-            if (idx < 0 || idx > 255) return 256;
-            int top = idx + ((t == 1) ? rows - 1 : 0);
-            if (top > mx) mx = top;
-        }
-    }
-    if (mx < 0) mx = 0;
-    if (mx > 255) mx = 255;
-    return mx + 1;
+    return p ? (int)p->kmax : 0;
 }
 
 /* Gölgelendirici oFog (RASTOUT#1) yaziyor mu?  D3D9'da kose gölgelendiricisi
@@ -1184,51 +1440,8 @@ int vs_kmax(const VSProg *p){
  * "c3.w==0 -> perspektif" testi yanlis pozitif veriyordu).
  * Doner: oPos.x'i ureten c# (yoksa -1); *wreg = oPos.w'yi ureten c#. */
 int vs_pos_creg(const VSProg *p, int *wreg){
-    int cx = -1, cw = -1;
-    if (wreg) *wreg = -1;
-    if (!p) return -1;
-    /* GECICI YAZMAC IZI: yol gölgelendiricileri (vs_4, vs_14) konumu once
-     * gecicilere hesaplayip sonra tasiyor:
-     *     dp4 r1.x, v0, c0 ... dp4 r0.w, v0, c3 ... mov oPos.x, r1.xxxx
-     *     mov oPos.yzw, r0
-     * Eski surum yalnizca DOGRUDAN oPos'a yazan dp4/m4x4'u goruyordu ve
-     * bu gölgelendiricilerde -1 donuyordu -> genis ekran (Hor+) duzeltmesi
-     * YOL YUZEYINE HIC UYGULANMIYORDU (yol yatayda 1/0.75 gerili).
-     * tsrc[yazmac][bilesen] = o bileseni "dp4 v0, c#" ile ureten sabit. */
-    int16_t tsrc[32][4];
-    memset(tsrc, 0xFF, sizeof tsrc);
-    for (unsigned q = 0; q < p->n; q++){
-        const VSIns *x = &p->ins[q];
-        if (!x->has_dst) continue;
-        unsigned m = WMASK(x->dst); if (!m) m = 0xFu;
-        if (RT(x->dst) == R_TEMP && RN(x->dst) < 32){
-            int k = -1;
-            if (x->op == O_DP4 && x->nsrc >= 2 && RT(x->src[1]) == R_CONST && !RELADDR(x->src[1]) &&
-                RT(x->src[0]) == R_INPUT)
-                k = RN(x->src[1]);
-            for (int c = 0; c < 4; c++) if (m & (1u << c)) tsrc[RN(x->dst)][c] = (int16_t)k;
-            continue;
-        }
-        if (RT(x->dst) != R_RASTOUT || RN(x->dst) != 0) continue;   /* oPos degil */
-        if (x->op == O_M4x4 || x->op == O_M4x3){
-            if (x->nsrc >= 2 && RT(x->src[1]) == R_CONST && !RELADDR(x->src[1])){
-                cx = RN(x->src[1]); cw = cx + 3; }
-        } else if (x->op == O_DP4 && x->nsrc >= 2 &&
-                   RT(x->src[1]) == R_CONST && !RELADDR(x->src[1])){
-            if (m & 1u) cx = RN(x->src[1]);
-            if (m & 8u) cw = RN(x->src[1]);
-        } else if (x->op == O_MOV && x->nsrc >= 1 && RT(x->src[0]) == R_TEMP &&
-                   RN(x->src[0]) < 32 && SMOD(x->src[0]) == 0u){
-            for (int c = 0; c < 4; c += 3){                 /* yalnizca x ve w */
-                if (!(m & (1u << c))) continue;
-                int sc = (int)((SWIZ(x->src[0]) >> (2 * c)) & 3u);
-                int k = tsrc[RN(x->src[0])][sc];
-                if (k >= 0){ if (c == 0) cx = k; else cw = k; }
-            }
-        }
-    }
-    if (wreg) *wreg = cw;
-    return cx;
+    if (wreg) *wreg = p ? (int)p->pos_cw : -1;
+    return p ? (int)p->pos_cx : -1;
 }
 
 /* Sis sabitlerinin yazmaci: NFSU2 kalibi (vs_4, vs_14, ...)
@@ -1237,16 +1450,7 @@ int vs_pos_creg(const VSProg *p, int *wreg){
  * yani sis = clamp((cK.x - derinlik) * cK.y, cK.z, 1).  Doner: K ya da -1. */
 int vs_writes_fog(const VSProg *p);
 int vs_fog_creg(const VSProg *p){
-    if (!p) return -1;
-    int k = -1;
-    for (unsigned q = 0; q < p->n; q++){
-        const VSIns *x = &p->ins[q];
-        if (!x->has_dst || x->op != O_MAX || x->nsrc < 2) continue;
-        if (RT(x->dst) != R_TEMP || RT(x->src[1]) != R_CONST || RELADDR(x->src[1])) continue;
-        if (((SWIZ(x->src[1])) & 3u) != 2u) continue;          /* .zzzz */
-        k = RN(x->src[1]);
-    }
-    return (k >= 0 && vs_writes_fog(p)) ? k : -1;
+    return p ? (int)p->fog_creg : -1;
 }
 
 /* Far isigi izdusumu (vs_13 sahne, vs_14 yol):
@@ -1256,40 +1460,15 @@ int vs_fog_creg(const VSProg *p){
  * kopyalarda far terimini isabet noktasinda bu matrisle yeniden kurar. */
 int vs_light_creg(const VSProg *p, float ramp[2]){
     if (!p) return -1;
-    int pr = vs_input_reg(p, 0, 0), k[3] = { -1, -1, -1 };
-    for (unsigned q = 0; q < p->n; q++){
-        const VSIns *x = &p->ins[q];
-        if (!x->has_dst || x->op != O_DP4 || x->nsrc < 2) continue;
-        if (RT(x->dst) != R_OUTPUT || RN(x->dst) != 1) continue;
-        if (RT(x->src[0]) != R_INPUT || RN(x->src[0]) != pr) continue;
-        if (RT(x->src[1]) != R_CONST || RELADDR(x->src[1])) continue;
-        unsigned m = WMASK(x->dst);
-        if (m == 1u) k[0] = RN(x->src[1]); else if (m == 2u) k[1] = RN(x->src[1]); else if (m == 4u) k[2] = RN(x->src[1]);
-    }
-    if (k[0] < 0 || k[1] != k[0] + 1 || k[2] != k[0] + 2 || k[0] + 3 > 255) return -1;
     if (ramp){
-        ramp[0] = 0.005f; ramp[1] = 0.5f;
-        for (unsigned q = 0; q < p->n; q++){
-            const VSIns *x = &p->ins[q];
-            if (!x->has_dst || x->op != O_MAD || x->nsrc < 3) continue;
-            if (RT(x->dst) != R_OUTPUT || RN(x->dst) != 2 || !(WMASK(x->dst) & 1u)) continue;
-            if (RT(x->src[1]) != R_CONST || RT(x->src[2]) != R_CONST) continue;
-            int a = RN(x->src[1]), b = RN(x->src[2]);
-            if (a > 255 || b > 255) continue;
-            if (!(p->defmask[a >> 5] & (1u << (a & 31))) || !(p->defmask[b >> 5] & (1u << (b & 31)))) continue;
-            ramp[0] = p->def[a][SWIZ(x->src[1]) & 3u]; ramp[1] = p->def[b][SWIZ(x->src[2]) & 3u];
-        }
+        ramp[0] = p->light_ramp[0];
+        ramp[1] = p->light_ramp[1];
     }
-    return k[0];
+    return (int)p->light_creg;
 }
 
 int vs_writes_fog(const VSProg *p){
-    if (!p) return 0;
-    for (unsigned q = 0; q < p->n; q++){
-        const VSIns *x = &p->ins[q];
-        if (x->has_dst && RT(x->dst) == R_RASTOUT && RN(x->dst) == 1) return 1;
-    }
-    return 0;
+    return p ? (int)p->writes_fog : 0;
 }
 
 /* bkz. metal.m RENK KIRPMA */

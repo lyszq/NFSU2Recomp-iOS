@@ -46,6 +46,7 @@ targets:
       - sdk: MetalKit.framework
       - sdk: QuartzCore.framework
       - sdk: GameController.framework
+      - sdk: CoreHaptics.framework
       - sdk: AVFoundation.framework
       - sdk: AudioToolbox.framework
     settings:

@@ -1,2 +1,2 @@
-Public runner / private IO request 2026-10-25 - v0.26.1 build 34; targeted startup-regression correction. Guest handoff cadence survives lifecycle reacquisition; v0.25 periodic host scheduler yield restored. Source reviewed after the owner's v0.26 black-screen log; device startup recovery remains unverified.
+Public runner / private IO request 2026-10-25 - v0.27.0 build 35; clean HUD, Settings sheet, DS4 CoreHaptics & controller config, Rachel/FEng input & DirectInput fixes, 48kHz audio alignment & loading stall guard, native iPad resolution + full LOD defaults, and runtime hot-path optimizations.
 Owner-reviewed environment required.

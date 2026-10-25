@@ -52,8 +52,15 @@ extern "C" {
  * Swift -> C Köprü Fonksiyonları (Sıfır Gecikme, Atomik Bellek Erişimi)
  */
 
-/* Belirli bir DIK_* tuşunun basılı olma durumunu ayarlar (1 = basılı, 0 = serbest) */
+/* Dokunmatik/genel kaynak için DIK_* durumunu ayarlar. */
 void nfsu2_input_set_key(uint8_t dik_code, bool is_pressed);
+
+/* Kontrolcü kaynağını dokunmatikten ayrı tutar; iki kaynak getter'da OR edilir. */
+void nfsu2_input_set_controller_key(uint8_t dik_code, bool is_pressed);
+void nfsu2_input_clear_controller(void);
+
+/* Uygulama menüsü/background sırasında bütün oyun girişini kapatır. */
+void nfsu2_input_set_enabled(bool enabled);
 
 /* Tüm tuş tamponunu (g_keys) sıfırlar (arka plana atılınca, kopmada veya duraklatmada çağrılır) */
 void nfsu2_input_clear_all(void);
@@ -66,6 +73,20 @@ uint32_t nfsu2_input_active_count(void);
 
 /* DirectInput 256 baytlık klavye tablosunu doldurur (0x80 = basılı, 0x00 = basılı değil) */
 void nfsu2_input_fill_keyboard(uint8_t *dst, uint32_t count);
+
+/*
+ * DirectInput buffered input için birleşik kaynakların kenar kuyruğu.
+ * index, mevcut kuyruğun başından ölçülür; false stale/olmayan kaydı belirtir.
+ */
+uint32_t nfsu2_input_event_snapshot(uint32_t *cursor);
+uint32_t nfsu2_input_event_generation(void);
+uint32_t nfsu2_input_event_reset_sequence_base(void);
+bool nfsu2_input_event_at(uint32_t cursor, uint32_t index,
+                          uint8_t *dik_code, bool *is_pressed,
+                          uint32_t *timestamp_ms, uint32_t *sequence);
+void nfsu2_input_consume_events(uint32_t cursor, uint32_t count);
+bool nfsu2_input_event_overflowed(void);
+bool nfsu2_input_take_event_overflow(void);
 
 /*
  * Konuk belleğe (guest memory) doğrudan eşitleme.

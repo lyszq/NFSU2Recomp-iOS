@@ -14,6 +14,11 @@ final class FullRuntimeSmokeTests: XCTestCase {
         XCTAssertTrue(start.waitForExistence(timeout: 20), "Authenticated full-runtime Start UI must be visible")
         start.tap()
 
+        // Runtime details now live in the settings sheet.
+        let settings = app.buttons["game-settings"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 20))
+        settings.tap()
+
         let status = app.staticTexts["full-runtime-status"].firstMatch
         XCTAssertTrue(status.waitForExistence(timeout: 20))
         let initialized = NSPredicate { _, _ in

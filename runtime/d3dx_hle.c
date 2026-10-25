@@ -67,7 +67,7 @@ int g_dx_in_pass = 0;          /* BeginPass/CommitChanges derinligi (COMSTAT) */
 static int  g_dx_on = -1;
 static long g_dx_from = 0, g_dx_f0 = -1;   /* D3DXSTAT=<kare>: o kareden itibaren say */
 static inline int dx_on(void){
-    if (g_dx_on < 0){
+    if (__builtin_expect(g_dx_on < 0, 0)){
         const char *e = getenv("D3DXSTAT");
         g_dx_on = e != NULL; g_dx_from = e ? atol(e) : 0;
     }
@@ -133,8 +133,14 @@ static uint64_t fnv(const uint8_t *p, uint32_t n, uint64_t h){
     for (uint32_t i = 0; i < n; i++){ h ^= p[i]; h *= 0x100000001b3ull; }
     return h;
 }
+static inline void an_init(void){
+    if (__builtin_expect(g_an_from < 0, 0)){
+        const char *e = getenv("D3DXANALYZE");
+        g_an_from = e ? atol(e) : 1L<<40;
+    }
+}
 static void analyze_eval(CPU *c){
-    if (g_an_from < 0){ const char *e = getenv("D3DXANALYZE"); g_an_from = e ? atol(e) : 1L<<40; }
+    an_init();
     if (metal_frames() < g_an_from) return;
     if (!g_an) g_an = calloc(AN_CAP, sizeof *g_an);
     uint32_t th = c->ecx, a = MR32(c->esp+4), b = MR32(c->esp+8);
@@ -204,6 +210,15 @@ typedef struct { uint32_t th, ab, eax, n, dst, dval, vval, len, valid; uint8_t b
 #define MEMO_CAP 4096u
 static MemoSlot *g_memo;
 static int g_memo_on = -1, g_verify_n = -1;
+static inline int memo_init(void){
+    if (__builtin_expect(g_memo_on < 0, 0)){
+        const char *m = getenv("D3DXMEMO");
+        g_memo_on = m ? atoi(m) != 0 : 1;
+        const char *v = getenv("D3DXVERIFY"); g_verify_n = v ? atoi(v) : 0;
+        if (g_memo_on || g_verify_n) g_memo = calloc(MEMO_CAP, sizeof *g_memo);
+    }
+    return g_memo_on;
+}
 static uint64_t m_calls, m_elig, m_big, m_hit, m_skip, m_guard, v_runs, v_clean, v_dirty;
 static uint8_t *v_buf0, *v_buf1;
 #define V_WIN   0x40000u
@@ -222,12 +237,23 @@ static inline __attribute__((always_inline)) int sw_put(SnapW *w, const void *p,
     uint8_t *q = w->d + w->len;
     const uint8_t *s = (const uint8_t *)p;
     if (w->eq){
-        uint64_t x = 0; uint32_t i = 0;
-        for (; i + 8u <= n; i += 8u){ uint64_t a, b; memcpy(&a, q+i, 8); memcpy(&b, s+i, 8); x |= a ^ b; }
-        for (; i + 4u <= n; i += 4u){ uint32_t a, b; memcpy(&a, q+i, 4); memcpy(&b, s+i, 4); x |= a ^ b; }
-        for (; i < n; i++) x |= (uint64_t)(q[i] ^ s[i]);
-        if (x){ w->eq = 0; memcpy(q, s, n); }
-    } else memcpy(q, s, n);
+        uint32_t i = 0;
+        for (; i + 8u <= n; i += 8u){
+            uint64_t a, b; memcpy(&a, q+i, 8); memcpy(&b, s+i, 8);
+            if (a != b){ w->eq = 0; memcpy(q, s, n); goto done_put; }
+        }
+        if (i + 4u <= n){
+            uint32_t a, b; memcpy(&a, q+i, 4); memcpy(&b, s+i, 4);
+            if (a != b){ w->eq = 0; memcpy(q, s, n); goto done_put; }
+            i += 4u;
+        }
+        for (; i < n; i++){
+            if (q[i] != s[i]){ w->eq = 0; memcpy(q, s, n); goto done_put; }
+        }
+    } else {
+        memcpy(q, s, n);
+    }
+done_put:
     w->len += n;
     return 1;
 }
@@ -265,18 +291,25 @@ static void verify_diff(uint32_t lo, uint32_t n, const uint8_t *before,
     }
 }
 
-static inline __attribute__((always_inline)) uint32_t rd32s(uint32_t a){ return (a && mem_is_committed(a) && mem_is_committed(a+3u)) ? MR32(a) : 0u; }
+static inline __attribute__((always_inline)) int mem_range_committed(uint32_t ga, uint32_t n){
+    if (!ga || !n) return 0;
+    uint32_t p0 = ga >> 14;
+    uint32_t p1 = (ga + n - 1u) >> 14;
+    if (__builtin_expect(p0 == p1, 1)){
+        return (__atomic_load_n(&g_cbits[p0 >> 3], __ATOMIC_ACQUIRE) >> (p0 & 7)) & 1;
+    }
+    return mem_is_committed(ga) && mem_is_committed(ga + n - 1u);
+}
+
+static inline __attribute__((always_inline)) uint32_t rd32s(uint32_t a){
+    return mem_range_committed(a, 4u) ? MR32(a) : 0u;
+}
 
 static int g_pctx_n;
 static void pctx_note_inputs(uint32_t R);
 void sub_00664a2f_orig(CPU *c);
 void sub_00664a2f(CPU *c){
-    if (g_memo_on < 0){
-        const char *m = getenv("D3DXMEMO");
-        g_memo_on = m ? atoi(m) != 0 : 1;
-        const char *v = getenv("D3DXVERIFY"); g_verify_n = v ? atoi(v) : 0;
-        if (g_memo_on || g_verify_n) g_memo = calloc(MEMO_CAP, sizeof *g_memo);
-    }
+    memo_init();
     uint32_t th = c->ecx, a = MR32(c->esp+4u), b = MR32(c->esp+8u);
     uint32_t P = a*0x64u + MR32(th+0x2cu), R = b*0x64u + MR32(P+4u);
     if (g_pctx_n) pctx_note_inputs(R);     /* Asama 3: gecis bagimliligi */
@@ -400,7 +433,7 @@ void sub_0065ab24(CPU *c){
         if (g_ab_n < AB_LOG){ g_ab_seq[g_ab_n][0] = c->ecx; g_ab_seq[g_ab_n][1] = sl; }
         g_ab_n++; g_ab_log = 0;
     }
-    if (g_pv_on && sl && mem_is_committed(sl) && mem_is_committed(sl+7u)){
+    if (g_pv_on && mem_range_committed(sl, 8u)){
         slot_range(sl, &dp, &n);
         if (n){
             uint32_t ep = ++g_pepoch;
@@ -421,7 +454,7 @@ void sub_0065ab24(CPU *c){
 static int g_dxn_on = -1, g_dxn_v = 0;
 static uint64_t mm_calls, mm_slow, mmv_runs, mmv_bad, pl_calls, plv_runs, plv_bad;
 static inline int dxn_on(void){
-    if (g_dxn_on < 0){
+    if (__builtin_expect(g_dxn_on < 0, 0)){
         const char *e = getenv("D3DXNATIVE"); g_dxn_on = e ? atoi(e) != 0 : 1;
         const char *v = getenv("D3DXNVERIFY"); g_dxn_v = v ? atoi(v) : 0;
     }
@@ -443,23 +476,28 @@ static inline __attribute__((always_inline)) int mm_ovl(uint32_t a, uint32_t b){
     return a != b && a - b + 63u < 127u;   /* |a-b| < 64 */
 }
 static inline __attribute__((always_inline)) int mm_load(float *M, uint32_t ga){
-    uint32_t u[16], bad = 0;
-    memcpy(u, g_mem + ga, 64);
+    memcpy(M, g_mem + ga, 64);
+    const uint32_t *u = (const uint32_t *)M;
+    uint32_t bad = 0;
     for (int k = 0; k < 16; k++) bad |= ((u[k] & 0x7f800000u) == 0x7f800000u);
-    memcpy(M, u, 64);
     return !bad;
 }
 static inline __attribute__((always_inline)) void mm_mul(float *R, const float *A, const float *B){
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 4; i++){
+        double a0 = (double)A[i*4+0];
+        double a1 = (double)A[i*4+1];
+        double a2 = (double)A[i*4+2];
+        double a3 = (double)A[i*4+3];
         for (int j = 0; j < 4; j++){
-            double p0 = (double)A[i*4+0] * (double)B[0*4+j];
-            double p1 = (double)A[i*4+1] * (double)B[1*4+j];
-            double p2 = (double)A[i*4+2] * (double)B[2*4+j];
-            double p3 = (double)A[i*4+3] * (double)B[3*4+j];
+            double p0 = a0 * (double)B[0*4+j];
+            double p1 = a1 * (double)B[1*4+j];
+            double p2 = a2 * (double)B[2*4+j];
+            double p3 = a3 * (double)B[3*4+j];
             double s1 = p2 + p0;
             double s2 = p1 + p3;
             R[i*4+j] = (float)(s1 + s2);
         }
+    }
 }
 void sub_0067193e_orig(CPU *c);
 void sub_0067193e(CPU *c){
@@ -568,7 +606,7 @@ void sub_0066056c(CPU *c){
         }
     }
     if (!(MR8(th+0x119u) & 1u)){ r = 0; goto done; }
-    r = pl_call(c, th, MR32(fp+8u), 0x6605feu);
+    r = pl_call(c, th, sl, 0x6605feu);
     }
 done:
     c->eax = r;
@@ -592,14 +630,15 @@ void sub_0065cf44(CPU *c){
     if ((t != 3u && t != 1u) || dst - src + 63u < 127u){ sm_slow++; sub_0065cf44_orig(c); return; }
     uint32_t S[16], D[16];
     memcpy(S, g_mem + src, 64);
-    double z = (double)MRF32(0x7d7d3cu), last = 0;
     if (t == 3u){
         for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) D[4*j+i] = S[4*i+j];
     } else {
+        double z = (double)MRF32(0x7d7d3cu), last = 0;
         for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++){
             float v; memcpy(&v, &S[4*i+j], 4); last = (double)v;
             D[4*j+i] = (last == z) ? 0u : 1u;
         }
+        fcompare(c, z, last);
     }
     if (g_dxn_v && (sm_calls % (uint64_t)g_dxn_v) == 0){
         sub_0065cf44_orig(c);
@@ -611,7 +650,7 @@ void sub_0065cf44(CPU *c){
     }
     memcpy(g_mem + dst, D, 64);
     if (t == 3u){ c->ecx = src + 0x30u; }
-    else { c->ecx = dst + 0x4cu; fcompare(c, z, last); }
+    else { c->ecx = dst + 0x4cu; }
     c->edx = 0; c->eax = 0;
     POP32(c->eip); c->esp += 12u;
 }
@@ -672,12 +711,20 @@ typedef struct {
 #define M2_CAP 8192u
 static M2Slot *g_m2;
 static int g_m2_on = -1, g_v2_n = 0;
+static inline int m2_init(void){
+    if (__builtin_expect(g_m2_on < 0, 0)){
+        const char *m = getenv("D3DXMEMO2"); g_m2_on = m ? atoi(m) != 0 : 1;
+        const char *v = getenv("D3DXVERIFY2"); g_v2_n = v ? atoi(v) : 0;
+        if (g_m2_on || g_v2_n) g_m2 = calloc(M2_CAP, sizeof *g_m2);
+    }
+    return g_m2_on;
+}
 static uint64_t m2_calls, m2_excl, m2_same, m2_hit, m2_skip, m2_norec, m2_devchg, m2_big;
 static uint64_t v2_runs, v2_clean, v2_mem, v2_dev, v2_eax;
 static uint64_t m2_type_calls[32], m2_type_hit[32], v2_type_bad[32];
 
 static inline __attribute__((always_inline)) int snap_bytes(SnapW *w, uint32_t ga, uint32_t n){
-    int ok = ga && mem_is_committed(ga) && mem_is_committed(ga + n - 1u);
+    int ok = mem_range_committed(ga, n);
     uint32_t tag = ok ? ga : 0u;
     if (!sw_put(w, &tag, 4)) return 0;
     return ok ? sw_put(w, g_mem + ga, n) : 1;
@@ -720,6 +767,13 @@ void sub_00664a2f(CPU *c);
 void sub_00669296_orig(CPU *c);
 void dispatch_indirect(CPU*, uint32_t);
 static int g_n4_on = -1, g_n4_v = 0;
+static inline int n4_init(void){
+    if (__builtin_expect(g_n4_on < 0, 0)){
+        const char *e = getenv("D3DXNATIVE4"); g_n4_on = e ? atoi(e) != 0 : 1;
+        const char *v = getenv("D3DXN4VERIFY"); g_n4_v = v ? atoi(v) : 0;
+    }
+    return g_n4_on;
+}
 static uint64_t n4_calls, n4_dirty, n4_issued, n4_skipped;
 #define NDRY 64
 typedef struct { uint64_t runs, bad, norec; } VStat;
@@ -772,8 +826,44 @@ typedef struct { uint32_t R, th, dst, dval, vb, vval, eax, n, base; uint32_t rec
 #define N4M_CAP 2048u
 static N4Memo *g_n4m;
 static int g_n4m_on = -1;
+static inline int n4m_init(void){
+    if (__builtin_expect(g_n4m_on < 0, 0)){
+        const char *e = getenv("D3DXN4MEMO"); g_n4m_on = e ? atoi(e) != 0 : 1;
+        if (g_n4m_on) g_n4m = calloc(N4M_CAP, sizeof *g_n4m);
+    }
+    return g_n4m_on;
+}
 static uint64_t n4m_hit, n4m_miss, n4m_big, n4m_why[4];
 void sub_00664a2f_orig(CPU *c);
+
+static inline __attribute__((always_inline)) int buf_eq(const void *a, const void *b, uint32_t n){
+    if (n == 16u){
+        uint64_t u1, u2, v1, v2;
+        memcpy(&u1, a, 8); memcpy(&u2, b, 8);
+        memcpy(&v1, (const char*)a + 8, 8); memcpy(&v2, (const char*)b + 8, 8);
+        return ((u1 ^ u2) | (v1 ^ v2)) == 0;
+    }
+    if (n == 4u){
+        uint32_t u1, u2; memcpy(&u1, a, 4); memcpy(&u2, b, 4);
+        return u1 == u2;
+    }
+    if (n == 8u){
+        uint64_t u1, u2; memcpy(&u1, a, 8); memcpy(&u2, b, 8);
+        return u1 == u2;
+    }
+    if (n == 64u){
+        const uint64_t *p1 = (const uint64_t *)a;
+        const uint64_t *p2 = (const uint64_t *)b;
+        uint64_t d = 0;
+        for (int k = 0; k < 8; k++){
+            uint64_t u1, u2; memcpy(&u1, p1 + k, 8); memcpy(&u2, p2 + k, 8);
+            d |= u1 ^ u2;
+        }
+        return d == 0;
+    }
+    return memcmp(a, b, n) == 0;
+}
+
 /* 1: girdiler toplandi (rec, pp, dp, nb doldu); 0: notlanamaz */
 static inline int n4m_inputs(uint32_t R, uint32_t *n, uint32_t *rec, uint32_t *pp, uint32_t *dp, uint32_t *nb){
     if (!MR32(R+0x38u) || (MR8(R+0x30u) & 4)){ n4m_why[0]++; return 0; }
@@ -791,8 +881,7 @@ static inline int n4m_inputs(uint32_t R, uint32_t *n, uint32_t *rec, uint32_t *p
     *n = k; return 1;
 }
 static inline uint32_t n4_eval(CPU *c, uint32_t th, uint32_t a, uint32_t b, uint32_t R, uint32_t P, uint32_t ret){
-    if (g_n4m_on < 0){ const char *e = getenv("D3DXN4MEMO"); g_n4m_on = e ? atoi(e) != 0 : 1;
-                       if (g_n4m_on) g_n4m = calloc(N4M_CAP, sizeof *g_n4m); }
+    n4m_init();
     N4Memo *s = NULL;
     uint32_t dst = MR32(R+0x48u) + MR32(P), vb = MR32(R+8u);
     if (g_n4m){
@@ -804,8 +893,8 @@ static inline uint32_t n4_eval(CPU *c, uint32_t th, uint32_t a, uint32_t b, uint
             && MR32(s->rec[0] + 0xcu) == s->pp[0] && MR32(s->pp[0]) == s->dp[0]
             && (s->n < 2 || (MR32(s->rec[1] + 0xcu) == s->pp[1] && MR32(s->pp[1]) == s->dp[1]))
             && rd32s(dst) == s->dval && rd32s(vb) == s->vval
-            && !memcmp(s->d, g_mem + s->dp[0], s->nb[0])
-            && (s->n < 2 || !memcmp(s->d + s->nb[0], g_mem + s->dp[1], s->nb[1]))){
+            && buf_eq(s->d, g_mem + s->dp[0], s->nb[0])
+            && (s->n < 2 || buf_eq(s->d + s->nb[0], g_mem + s->dp[1], s->nb[1]))){
             n4m_hit++;
             return s->eax;
         }
@@ -836,10 +925,17 @@ static inline uint32_t n4_eval(CPU *c, uint32_t th, uint32_t a, uint32_t b, uint
 static uint64_t n6_calls;
 static VStat n6vs;
 static int g_n6_on = -1;
+static inline int n6_init(void){
+    if (__builtin_expect(g_n6_on < 0, 0)){
+        const char *e = getenv("D3DXNATIVE6"); g_n6_on = e ? atoi(e) != 0 : 1;
+    }
+    return g_n6_on;
+}
 static int n6_samp(CPU *c, uint32_t th, uint32_t P, uint32_t Rb, uint32_t Re, uint32_t *res){
     uint32_t base = MR32(th+0x2cu);
+    uint32_t MP = MR32(P);
     for (uint32_t R = Rb; R < Re; R += 0x64u){
-        uint32_t vp = MR32(R+0x48u) + MR32(P);
+        uint32_t vp = MR32(R+0x48u) + MP;
         uint32_t P2 = (MR16(vp+2u) + MR16(vp))*0x64u + base - 0x64u, end = MR16(R+0x56u)*0x64u + P2;
         for (; P2 < end; P2 += 0x64u){
             uint32_t R2 = MR32(P2+4u);
@@ -852,14 +948,14 @@ static int n6_samp(CPU *c, uint32_t th, uint32_t P, uint32_t Rb, uint32_t Re, ui
     n6_calls++;
     uint32_t dev = MR32(th+8u), r;
     for (uint32_t R = Rb; R < Re; R += 0x64u){
-        uint32_t vp = MR32(R+0x48u) + MR32(P), stage = MR16(R+0x54u);
+        uint32_t vp = MR32(R+0x48u) + MP, stage = MR16(R+0x54u);
         uint32_t P2 = (MR16(vp+2u) + MR16(vp))*0x64u + base - 0x64u, end = MR16(R+0x56u)*0x64u + P2;
         for (; P2 < end; P2 += 0x64u, stage++){
             uint32_t R2 = MR32(P2+4u);
             for (uint32_t k = 0; k < MR16(P2+0x36u); k++, R2 += 0x64u){
                 if (MR8(R2+0x5bu) == 3u){
                     if (MR32(R2)){
-                        uint32_t rec = (uint32_t)((int32_t)(P2 - MR32(th+0x2cu)) / 0x64) & 0xffffu;
+                        uint32_t rec = (uint32_t)((int32_t)(P2 - base) / 0x64) & 0xffffu;
                         r = n4_eval(c, th, rec, k, R2, P2, 0x668d51u);
                         if ((int32_t)r < 0){ *res = r; return 1; }
                         MR32(R2) = MR32(R2+4u);
@@ -887,8 +983,7 @@ static int n6_apply(CPU *c){
 }
 void sub_00668cd0_orig(CPU *c);
 void sub_00668cd0(CPU *c){
-    if (g_n6_on < 0){ const char *e = getenv("D3DXNATIVE6"); g_n6_on = e ? atoi(e) != 0 : 1; }
-    if (g_n6_on && !g_pctx_n){
+    if (n6_init() && !g_pctx_n){
         if (g_n4_v){
             static uint64_t vk;
             if ((++vk % (uint64_t)g_n4_v) == 0){
@@ -931,6 +1026,12 @@ void sub_00668e0d_orig(CPU *c);
 static uint64_t n7_calls;
 static VStat n7vs;
 static int g_n7_on = -1;
+static inline int n7_init(void){
+    if (__builtin_expect(g_n7_on < 0, 0)){
+        const char *e = getenv("D3DXNATIVE7"); g_n7_on = e ? atoi(e) != 0 : 1;
+    }
+    return g_n7_on;
+}
 /* doldurucu: fn(this, R+8, hedef, w[R+0x56], [R+0x3c], [[R+0x34]+0x10], &yuva, [o+0x4c]) */
 static inline void n7_fill(CPU *c, void (*fn)(CPU*), uint32_t ret, uint32_t th, uint32_t P, uint32_t R, uint32_t *slot8){
     uint32_t o = MR32(MR32(th+0xb0u) + MR32(R+0x1cu)*4u);
@@ -1020,7 +1121,7 @@ static int n7_apply(CPU *c){
     return 1;
 }
 void sub_00668e0d(CPU *c){
-    if (g_n7_on < 0){ const char *e = getenv("D3DXNATIVE7"); g_n7_on = e ? atoi(e) != 0 : 1; }
+    n7_init();
     uint64_t t0 = dx_on() ? mach_absolute_time() : 0;
     if (g_n7_on && !g_pctx_n){
         static uint64_t vk;
@@ -1127,8 +1228,8 @@ out:
  * degeri.  Yigina dokunmaz (664a2f ve cihaz cagrilari icin it/cek haric). */
 void sub_006691b1(CPU *c); void sub_00668e0d(CPU*);
 static uint64_t n4_obj;
-static inline int n4_core(CPU *c, uint32_t th, uint32_t a, uint32_t b, uint32_t eld, uint32_t *res){
-    uint32_t P = a*0x64u + MR32(th+0x2cu), R = b*0x64u + MR32(P+4u);
+static inline int n4_core(CPU *c, uint32_t th, uint32_t a, uint32_t b, uint32_t eld,
+                          uint32_t P, uint32_t R, uint32_t *res){
     uint32_t code = MR32(R+0x58u), type = code >> 24, el = eld & 0xffffu;
     if (el == 0xffffu) el = MR16(R+0x54u);
     int dirty = MR32(R) != 0;
@@ -1181,9 +1282,9 @@ static inline int n4_core(CPU *c, uint32_t th, uint32_t a, uint32_t b, uint32_t 
 static int n4_apply(CPU *c){
     uint32_t th = c->ecx, sp = c->esp, res;
     uint32_t a = MR16(sp+4u), b = MR16(sp+8u), el = MR16(sp+12u);
-    if (!n4_core(c, th, a, b, MR32(sp+12u), &res)) return 0;
+    uint32_t P = a*0x64u + MR32(th+0x2cu), R = b*0x64u + MR32(P+4u);
+    if (!n4_core(c, th, a, b, MR32(sp+12u), P, R, &res)) return 0;
     if (el == 0xffffu){                                  /* orijinal arguman yuvasina yazar */
-        uint32_t P = a*0x64u + MR32(th+0x2cu), R = b*0x64u + MR32(P+4u);
         MR16(sp+12u) = MR16(R+0x54u);
     }
     c->eax = res; POP32(c->eip); c->esp += 12u;
@@ -1260,11 +1361,7 @@ static void n4_verify(CPU *c){
 
 void sub_00669296_orig(CPU *c);
 void sub_00669296(CPU *c){
-    if (g_n4_on < 0){
-        const char *e = getenv("D3DXNATIVE4"); g_n4_on = e ? atoi(e) != 0 : 1;
-        const char *v = getenv("D3DXN4VERIFY"); g_n4_v = v ? atoi(v) : 0;
-    }
-    if (g_n4_on && !g_pctx_n){
+    if (n4_init() && !g_pctx_n){
         uint64_t t0 = dx_on() ? mach_absolute_time() : 0;
         static uint64_t vk;
         if (g_n4_v && (++vk % (uint64_t)g_n4_v) == 0){
@@ -1277,11 +1374,7 @@ n4out:
             return;
         }
     }
-    if (g_m2_on < 0){
-        const char *m = getenv("D3DXMEMO2"); g_m2_on = m ? atoi(m) != 0 : 1;
-        const char *v = getenv("D3DXVERIFY2"); g_v2_n = v ? atoi(v) : 0;
-        if (g_m2_on || g_v2_n) g_m2 = calloc(M2_CAP, sizeof *g_m2);
-    }
+    m2_init();
     uint64_t t0 = dx_on() ? mach_absolute_time() : 0;
     if (!g_m2){
         if (g_pctx_n){ uint32_t th = c->ecx, a = MR16(c->esp+4u), b = MR16(c->esp+8u);
@@ -1393,6 +1486,18 @@ typedef struct {
 #define M3_CAP 2048u
 static M3Slot *g_m3;
 static int g_m3_on = -1, g_v3_n = 0;
+static inline int m3_init(void){
+    if (__builtin_expect(g_m3_on < 0, 0)){
+        /* VARSAYILAN KAPALI: D3DXVERIFY3 gecis duzeyinde atlamanin yanlis
+         * oldugunu gosterdi (dokular nesne tablosundan geliyor, parametre
+         * verisinden degil; tahmini isabetlerin %78'i gercekte farkliydi).
+         * Yalnizca arastirma icin D3DXMEMO3=1. */
+        const char *m = getenv("D3DXMEMO3"); g_m3_on = m ? atoi(m) != 0 : 0;
+        const char *v = getenv("D3DXVERIFY3"); g_v3_n = v ? atoi(v) : 0;
+        if (g_m3_on || g_v3_n){ g_m3 = calloc(M3_CAP, sizeof *g_m3); g_pv_on = 1; }
+    }
+    return g_m3_on;
+}
 static uint64_t m3_calls, m3_fp, m3_dep, m3_dev, m3_inel, m3_hit, m3_skip, m3_rec, m3_recok;
 static uint64_t v3_runs, v3_clean, v3_mem, v3_dev, v3_eax, m3_why[8]; static uint32_t m3_why_tm;
 
@@ -1424,10 +1529,17 @@ void sub_006691b1_orig(CPU *c);
 void sub_0066404c(CPU*); void sub_006641a7(CPU*); void sub_00667d61(CPU*);
 void sub_00666e07(CPU*); void sub_00668e0d(CPU*);
 static int g_n5_on = -1;
+static inline int n5_init(void){
+    if (__builtin_expect(g_n5_on < 0, 0)){
+        const char *e = getenv("D3DXNATIVE5"); g_n5_on = e ? atoi(e) != 0 : 1;
+    }
+    return g_n5_on;
+}
 static uint64_t n5_calls;
-static inline uint32_t n5_state(CPU *c, uint32_t th, uint32_t aw, uint32_t b, uint32_t el, uint32_t ret){
+static inline uint32_t n5_state(CPU *c, uint32_t th, uint32_t aw, uint32_t b, uint32_t el,
+                                uint32_t P, uint32_t R, uint32_t ret){
     uint32_t res;
-    if (!g_n4_v && n4_core(c, th, aw & 0xffffu, b, el, &res)) return res;
+    if (!g_n4_v && n4_core(c, th, aw & 0xffffu, b, el, P, R, &res)) return res;
     c->ecx = th; PUSH32(el); PUSH32(b); PUSH32(aw); PUSH32(ret);
     sub_00669296(c);
     return c->eax;
@@ -1451,19 +1563,22 @@ static void n5_pass(CPU *c){
         else { PUSH32(0x669222u); sub_00666e07(c); }
         r = c->eax; if ((int32_t)r < 0) goto done;
     }
-    if (MR32(th+0x3cu) == 4u){
+    uint32_t nstates = MR16(P+0x36u);
+    uint32_t base_R = MR32(P+4u);
+    uint32_t mode = MR32(th+0x3cu);
+    if (mode == 4u){
         if (MR8(P+8u) & 1u){
             c->ecx = th; PUSH32(P); PUSH32(0x66923au); sub_00668e0d(c);
             r = c->eax; goto done;
         }
-        for (uint32_t b = 0; b < MR16(P+0x36u); b++){
-            r = n5_state(c, th, aw, b, el, 0x669259u);
+        for (uint32_t b = 0; b < nstates; b++){
+            r = n5_state(c, th, aw, b, el, P, base_R + b*0x64u, 0x669259u);
             if ((int32_t)r < 0) goto done;
         }
     } else {
-        for (uint32_t b = 0; b < MR16(P+0x36u); b++){
-            r = n5_state(c, th, aw, b, el, 0x66927cu);
-            if ((int32_t)r < 0 && MR32(th+0x3cu) != 1u) goto done;
+        for (uint32_t b = 0; b < nstates; b++){
+            r = n5_state(c, th, aw, b, el, P, base_R + b*0x64u, 0x66927cu);
+            if ((int32_t)r < 0 && mode != 1u) goto done;
         }
     }
     r = 0;
@@ -1474,22 +1589,13 @@ done:
 }
 
 void sub_006691b1(CPU *c){
-    if (g_n5_on < 0){ const char *e = getenv("D3DXNATIVE5"); g_n5_on = e ? atoi(e) != 0 : 1; }
-    if (g_n5_on && g_n4_on > 0 && !g_m3_on && !g_pctx_n){
+    if (n5_init() && n4_init() && !m3_init() && !g_pctx_n){
         uint64_t t0 = dx_on() ? mach_absolute_time() : 0;
         n5_pass(c);
         if (t0){ g_dx[DX_PASSAPPLY].ticks += mach_absolute_time() - t0; g_dx[DX_PASSAPPLY].n++; }
         return;
     }
-    if (g_m3_on < 0){
-        /* VARSAYILAN KAPALI: D3DXVERIFY3 gecis duzeyinde atlamanin yanlis
-         * oldugunu gosterdi (dokular nesne tablosundan geliyor, parametre
-         * verisinden degil; tahmini isabetlerin %78'i gercekte farkliydi).
-         * Yalnizca arastirma icin D3DXMEMO3=1. */
-        const char *m = getenv("D3DXMEMO3"); g_m3_on = m ? atoi(m) != 0 : 0;
-        const char *v = getenv("D3DXVERIFY3"); g_v3_n = v ? atoi(v) : 0;
-        if (g_m3_on || g_v3_n){ g_m3 = calloc(M3_CAP, sizeof *g_m3); g_pv_on = 1; }
-    }
+    m3_init();
     uint64_t t0 = dx_on() ? mach_absolute_time() : 0;
     if (!g_m3){ sub_006691b1_orig(c); goto out3; }
     {
@@ -1617,11 +1723,14 @@ static void cw_counts(uint64_t *v){
     v[0] = v[1] = 0;
     if (cw_tsc) cw_tsc(1, v, 2 * sizeof(uint64_t));
 }
-void guest_cpu_mark(void){
-    if (cw_from == -2){
+static inline void cw_init(void){
+    if (__builtin_expect(cw_from == -2, 0)){
         const char *e = getenv("CPUWIN"); cw_from = -1;
         if (e){ cw_from = atol(e); const char *k = strchr(e, ','); cw_to = k ? atol(k+1) : 1L<<40; }
     }
+}
+void guest_cpu_mark(void){
+    cw_init();
     if (cw_from < 0) return;
     long f = metal_frames();
     if (f < cw_from || (cw_f1 >= 0 && f > cw_to)) return;
@@ -1648,6 +1757,21 @@ __attribute__((constructor)) static void efx_init(void){
     const char *e = getenv("EFXSTAT");
     g_efx_stat = e != NULL || getenv("FXTRACE") != NULL;
     efx_from = e ? atol(e) : (1L << 40);
+}
+__attribute__((constructor)) static void d3dx_hle_init_all(void){
+    dx_on();
+    an_init();
+    memo_init();
+    dxn_on();
+    m2_init();
+    n4_init();
+    n4m_init();
+    n6_init();
+    n7_init();
+    n8_init();
+    m3_init();
+    n5_init();
+    cw_init();
 }
 /* FXTRACE: efekt metodu isareti (com.c'deki cihaz cagrisi iziyle ayni akista) */
 static void efx_trace(CPU *c, int k){

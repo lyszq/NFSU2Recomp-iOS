@@ -11,6 +11,12 @@
 #include "guest_memory.h"
 #include <stdatomic.h>
 #include <string.h>
+#include <time.h>
+
+#if defined(NFS_FULL_RUNTIME) && NFS_FULL_RUNTIME
+/* Match DirectInput's GetTickCount-style clock source in runtime/com.c. */
+extern uint64_t host_us(void);
+#endif
 
 /*
  * DirectInput 8 klavye durumu için 256 baytlık atomik tablo.
@@ -18,26 +24,160 @@
  * DirectInput standart GetDeviceState ve GetDeviceData çağrılarında
  * basılı tuşlar için en yüksek bit olan 0x80 beklenir.
  */
-static _Atomic uint8_t g_keys[256];
+static _Atomic uint8_t g_touch_keys[256];
+static _Atomic uint8_t g_controller_keys[256];
+static _Atomic bool g_input_enabled = ATOMIC_VAR_INIT(true);
 
-void nfsu2_input_set_key(uint8_t dik_code, bool is_pressed) {
-    atomic_store_explicit(&g_keys[dik_code], is_pressed ? 1 : 0, memory_order_release);
+#define INPUT_EVENT_CAPACITY 512u
+#define INPUT_EVENT_MASK (INPUT_EVENT_CAPACITY - 1u)
+typedef struct {
+    _Atomic uint8_t dik_code;
+    _Atomic uint8_t is_pressed;
+    _Atomic uint32_t timestamp_ms;
+    _Atomic uint32_t sequence;
+    _Atomic uint32_t generation;
+} InputKeyEvent;
+
+/* Swift/UI is the single producer; the guest runtime is the single consumer. */
+static InputKeyEvent g_input_events[INPUT_EVENT_CAPACITY];
+static _Atomic uint32_t g_input_event_head;
+static _Atomic uint32_t g_input_event_tail;
+static _Atomic uint32_t g_input_event_generation = ATOMIC_VAR_INIT(1u);
+static _Atomic uint32_t g_input_event_write_generation = ATOMIC_VAR_INIT(1u);
+static _Atomic uint32_t g_input_event_sequence;
+static _Atomic uint32_t g_input_event_reset_sequence_base;
+static _Atomic bool g_input_event_overflow;
+
+static bool input_enabled(void) {
+    return atomic_load_explicit(&g_input_enabled, memory_order_acquire);
 }
 
-void nfsu2_input_clear_all(void) {
-    for (int i = 0; i < 256; i++) {
-        atomic_store_explicit(&g_keys[i], 0, memory_order_relaxed);
+static bool input_key_state(uint8_t dik_code) {
+    return atomic_load_explicit(&g_touch_keys[dik_code], memory_order_acquire) != 0 ||
+           atomic_load_explicit(&g_controller_keys[dik_code], memory_order_acquire) != 0;
+}
+
+static uint32_t input_timestamp_ms(void) {
+#if defined(NFS_FULL_RUNTIME) && NFS_FULL_RUNTIME
+    return (uint32_t)(host_us() / 1000ull);
+#else
+    struct timespec now;
+    if (timespec_get(&now, TIME_UTC) != TIME_UTC) return 0;
+    return (uint32_t)((uint64_t)now.tv_sec * 1000u +
+                      (uint64_t)now.tv_nsec / 1000000u);
+#endif
+}
+
+static void input_queue_edge(uint8_t dik_code, bool is_pressed) {
+    uint32_t head = atomic_load_explicit(&g_input_event_head, memory_order_relaxed);
+    uint32_t tail = atomic_load_explicit(&g_input_event_tail, memory_order_acquire);
+    if ((uint32_t)(head - tail) >= INPUT_EVENT_CAPACITY) {
+        if (!atomic_load_explicit(&g_input_event_overflow, memory_order_relaxed)) {
+            uint32_t reset_sequence_base = atomic_fetch_add_explicit(
+                &g_input_event_sequence, INPUT_EVENT_CAPACITY,
+                memory_order_acq_rel) + 1u;
+            atomic_store_explicit(&g_input_event_reset_sequence_base,
+                                  reset_sequence_base, memory_order_release);
+            atomic_store_explicit(&g_input_event_overflow, true,
+                                  memory_order_release);
+        }
+        return;
+    }
+
+    InputKeyEvent *event = &g_input_events[head & INPUT_EVENT_MASK];
+    atomic_store_explicit(&event->dik_code, dik_code, memory_order_relaxed);
+    atomic_store_explicit(&event->is_pressed, is_pressed ? 1u : 0u,
+                          memory_order_relaxed);
+    atomic_store_explicit(&event->timestamp_ms, input_timestamp_ms(),
+                          memory_order_relaxed);
+    atomic_store_explicit(&event->sequence,
+                          atomic_fetch_add_explicit(&g_input_event_sequence, 1u,
+                                                    memory_order_relaxed) + 1u,
+                          memory_order_relaxed);
+    atomic_store_explicit(&event->generation,
+                          atomic_load_explicit(&g_input_event_write_generation,
+                                               memory_order_acquire),
+                          memory_order_relaxed);
+    atomic_store_explicit(&g_input_event_head, head + 1u, memory_order_release);
+}
+
+static void recompute_key_locked(uint8_t dik_code, bool was_pressed) {
+    bool now_pressed = input_key_state(dik_code);
+    if (input_enabled() && was_pressed != now_pressed)
+        input_queue_edge(dik_code, now_pressed);
+}
+
+static void input_set_source(_Atomic uint8_t *source, uint8_t dik_code,
+                             uint8_t v) {
+    bool was_pressed = input_key_state(dik_code);
+    atomic_store_explicit(&source[dik_code], v, memory_order_release);
+    recompute_key_locked(dik_code, was_pressed);
+}
+
+void nfsu2_input_set_key(uint8_t dik_code, bool is_pressed) {
+    if (!input_enabled()) return;
+    uint8_t v = is_pressed ? 1u : 0u;
+    if (atomic_load_explicit(&g_touch_keys[dik_code], memory_order_acquire) == v)
+        return;
+    input_set_source(g_touch_keys, dik_code, v);
+}
+
+void nfsu2_input_set_controller_key(uint8_t dik_code, bool is_pressed) {
+    if (!input_enabled()) return;
+    uint8_t v = is_pressed ? 1u : 0u;
+    if (atomic_load_explicit(&g_controller_keys[dik_code], memory_order_acquire) == v)
+        return;
+    input_set_source(g_controller_keys, dik_code, v);
+}
+
+void nfsu2_input_clear_controller(void) {
+    for (uint32_t i = 0; i < 256; i++) {
+        bool was_pressed = input_key_state((uint8_t)i);
+        atomic_store_explicit(&g_controller_keys[i], 0, memory_order_release);
+        bool now_pressed = input_key_state((uint8_t)i);
+        if (input_enabled() && was_pressed && !now_pressed)
+            input_queue_edge((uint8_t)i, false);
     }
 }
 
+void nfsu2_input_set_enabled(bool enabled) {
+    if (enabled) {
+        atomic_store_explicit(&g_input_enabled, true, memory_order_release);
+        return;
+    }
+
+    atomic_store_explicit(&g_input_enabled, false, memory_order_release);
+    nfsu2_input_clear_all();
+    guest_cursor_set_available(false);
+}
+
+void nfsu2_input_clear_all(void) {
+    uint32_t reset_sequence_base = atomic_fetch_add_explicit(
+        &g_input_event_sequence, INPUT_EVENT_CAPACITY, memory_order_acq_rel) + 1u;
+    atomic_store_explicit(&g_input_event_reset_sequence_base,
+                          reset_sequence_base, memory_order_release);
+    uint32_t write_generation = atomic_fetch_add_explicit(
+        &g_input_event_write_generation, 1u, memory_order_acq_rel) + 1u;
+    for (int i = 0; i < 256; i++) {
+        atomic_store_explicit(&g_touch_keys[i], 0, memory_order_relaxed);
+        atomic_store_explicit(&g_controller_keys[i], 0, memory_order_relaxed);
+    }
+    uint32_t head = atomic_load_explicit(&g_input_event_head, memory_order_acquire);
+    atomic_store_explicit(&g_input_event_tail, head, memory_order_release);
+    atomic_store_explicit(&g_input_event_overflow, false, memory_order_release);
+    atomic_store_explicit(&g_input_event_generation, write_generation,
+                          memory_order_release);
+}
+
 bool nfsu2_input_get_key(uint8_t dik_code) {
-    return atomic_load_explicit(&g_keys[dik_code], memory_order_acquire) != 0;
+    return input_enabled() && input_key_state(dik_code);
 }
 
 uint32_t nfsu2_input_active_count(void) {
+    if (!input_enabled()) return 0;
     uint32_t count = 0;
     for (int i = 0; i < 256; i++) {
-        if (atomic_load_explicit(&g_keys[i], memory_order_relaxed)) {
+        if (input_key_state((uint8_t)i)) {
             count++;
         }
     }
@@ -47,9 +187,82 @@ uint32_t nfsu2_input_active_count(void) {
 void nfsu2_input_fill_keyboard(uint8_t *dst, uint32_t count) {
     if (!dst) return;
     if (count > 256) count = 256;
+    bool enabled = input_enabled();
     for (uint32_t i = 0; i < count; i++) {
-        dst[i] = atomic_load_explicit(&g_keys[i], memory_order_acquire) ? 0x80 : 0x00;
+        dst[i] = enabled && input_key_state((uint8_t)i) ? 0x80 : 0x00;
     }
+}
+
+uint32_t nfsu2_input_event_snapshot(uint32_t *cursor) {
+    uint32_t tail = atomic_load_explicit(&g_input_event_tail, memory_order_acquire);
+    uint32_t head = atomic_load_explicit(&g_input_event_head, memory_order_acquire);
+    uint32_t count = head - tail;
+    if (count > INPUT_EVENT_CAPACITY) count = INPUT_EVENT_CAPACITY;
+    if (cursor) *cursor = tail;
+    return input_enabled() ? count : 0;
+}
+
+uint32_t nfsu2_input_event_generation(void) {
+    return atomic_load_explicit(&g_input_event_generation, memory_order_acquire);
+}
+
+uint32_t nfsu2_input_event_reset_sequence_base(void) {
+    return atomic_load_explicit(&g_input_event_reset_sequence_base,
+                                memory_order_acquire);
+}
+
+bool nfsu2_input_event_at(uint32_t cursor, uint32_t index,
+                          uint8_t *dik_code, bool *is_pressed,
+                          uint32_t *timestamp_ms, uint32_t *sequence) {
+    if (!input_enabled()) return false;
+    if (atomic_load_explicit(&g_input_event_tail, memory_order_acquire) != cursor)
+        return false;
+    uint32_t head = atomic_load_explicit(&g_input_event_head, memory_order_acquire);
+    if ((uint32_t)(head - cursor) > INPUT_EVENT_CAPACITY || index >= head - cursor)
+        return false;
+
+    const InputKeyEvent *event = &g_input_events[(cursor + index) & INPUT_EVENT_MASK];
+    uint32_t generation = atomic_load_explicit(&g_input_event_generation,
+                                                memory_order_acquire);
+    uint32_t event_generation = atomic_load_explicit(&event->generation,
+                                                     memory_order_relaxed);
+    uint8_t key = atomic_load_explicit(&event->dik_code, memory_order_relaxed);
+    uint8_t pressed = atomic_load_explicit(&event->is_pressed, memory_order_relaxed);
+    uint32_t timestamp = atomic_load_explicit(&event->timestamp_ms,
+                                              memory_order_relaxed);
+    uint32_t serial = atomic_load_explicit(&event->sequence, memory_order_relaxed);
+    if (event_generation != generation || !input_enabled() ||
+        generation != atomic_load_explicit(&g_input_event_generation,
+                                            memory_order_acquire) ||
+        atomic_load_explicit(&g_input_event_tail, memory_order_acquire) != cursor)
+        return false;
+    if (dik_code) *dik_code = key;
+    if (is_pressed) *is_pressed = pressed != 0;
+    if (timestamp_ms) *timestamp_ms = timestamp;
+    if (sequence) *sequence = serial;
+    return true;
+}
+
+void nfsu2_input_consume_events(uint32_t cursor, uint32_t count) {
+    if (!count) return;
+    uint32_t head = atomic_load_explicit(&g_input_event_head, memory_order_acquire);
+    uint32_t available = head - cursor;
+    if (available > INPUT_EVENT_CAPACITY) return;
+    if (count > available) count = available;
+    uint32_t expected = cursor;
+    (void)atomic_compare_exchange_strong_explicit(&g_input_event_tail, &expected,
+                                                  cursor + count,
+                                                  memory_order_acq_rel,
+                                                  memory_order_acquire);
+}
+
+bool nfsu2_input_take_event_overflow(void) {
+    return atomic_exchange_explicit(&g_input_event_overflow, false,
+                                   memory_order_acq_rel);
+}
+
+bool nfsu2_input_event_overflowed(void) {
+    return atomic_load_explicit(&g_input_event_overflow, memory_order_acquire);
 }
 
 void nfsu2_input_sync_guest_memory(void) {
@@ -114,14 +327,21 @@ __attribute__((weak)) int metal_available(void) {
 #endif
 
 void nfsu2_input_set_cursor(float host_x, float host_y, bool is_down) {
+    if (!input_enabled()) return;
     guest_cursor_set_host_pos(host_x, host_y, is_down);
 }
 
 void nfsu2_input_set_cursor_available(bool available) {
+    if (available && !input_enabled()) return;
     guest_cursor_set_available(available);
 }
 
 bool nfsu2_input_get_cursor(int *x, int *y) {
+    if (!input_enabled()) {
+        if (x) *x = 0;
+        if (y) *y = 0;
+        return false;
+    }
     GuestCursorSnapshot snapshot = guest_cursor_get_snapshot();
     if (x) *x = snapshot.coords.x;
     if (y) *y = snapshot.coords.y;
@@ -129,6 +349,12 @@ bool nfsu2_input_get_cursor(int *x, int *y) {
 }
 
 bool nfsu2_input_get_cursor_snapshot(int32_t *x, int32_t *y, uint32_t *flags) {
+    if (!input_enabled()) {
+        if (x) *x = 0;
+        if (y) *y = 0;
+        if (flags) *flags = 0;
+        return false;
+    }
     GuestCursorSnapshot snapshot = guest_cursor_get_snapshot();
     if (x) *x = snapshot.coords.x;
     if (y) *y = snapshot.coords.y;

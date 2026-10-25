@@ -56,9 +56,13 @@ int g_bt_on = 0;
  * TEB must never manufacture a guest mapping solely to store an error. */
 static _Thread_local uint32_t g_last_error_fallback;
 static void *last_error_slot(CPU *c, int write_access){
-    if (!c || !c->fs_base || (uint64_t)c->fs_base + 0x38u > GUEST_MEMORY_SIZE)
+    (void)write_access;
+    if (!c || !c->fs_base || !g_mem || (uint64_t)c->fs_base + 0x38u > GUEST_MEMORY_SIZE)
         return NULL;
-    return guest_memory_pointer(c->fs_base + 0x34u, 4u, write_access);
+    uint32_t addr = c->fs_base + 0x34u;
+    if (!mem_is_committed(addr) || !mem_is_committed(addr + 3u))
+        return NULL;
+    return g_mem + addr;
 }
 void win32_set_last_error(CPU *c, uint32_t value){
     g_last_error_fallback = value;
@@ -349,11 +353,28 @@ int win32_call(CPU *c, uint32_t idx){
     /* QueryPerformanceCounter en sik cagri (kare sinirlayici); ad zincirinin
      * ~20 strcmp'ini atlamak icin import indisi ilk eslesmede onbellege alinir. */
     static uint32_t qpc_idx = 0xFFFFFFFFu;
+    static uint32_t ecs_idx = 0xFFFFFFFFu;
+    static uint32_t lcs_idx = 0xFFFFFFFFu;
+    static uint32_t tgv_idx = 0xFFFFFFFFu;
+    static uint32_t gle_idx = 0xFFFFFFFFu;
+    static uint32_t sle_idx = 0xFFFFFFFFu;
     if (idx == qpc_idx || (qpc_idx == 0xFFFFFFFFu && !strcmp(n,"QueryPerformanceCounter") && (qpc_idx = idx, 1))){
         if (ENVC("QPCWHO")) qpc_who(c);
         if (c->eip == 0x43bdfeu) qpc_spin_sleep(c);
         uint64_t v = host_qpc(); uint32_t p=ARG(c,0);
         if(p){ MR32(p)=(uint32_t)v; MR32(p+4)=(uint32_t)(v>>32); } r=1; }
+    else if (idx == ecs_idx || (ecs_idx == 0xFFFFFFFFu && !strcmp(n,"EnterCriticalSection") && (ecs_idx = idx, 1)) ||
+             idx == lcs_idx || (lcs_idx == 0xFFFFFFFFu && !strcmp(n,"LeaveCriticalSection") && (lcs_idx = idx, 1))){
+        win32_ext_call(c, n, &r); }
+    else if (idx == tgv_idx || (tgv_idx == 0xFFFFFFFFu && !strcmp(n,"TlsGetValue") && (tgv_idx = idx, 1))){
+        uint32_t i=ARG(c,0);
+        uint32_t arr = (c->fs_base && mem_is_committed(c->fs_base+0x2cu)) ? MR32(c->fs_base+0x2cu) : 0;
+        if (arr && i<256u && mem_is_committed(arr+4u*i)) r = MR32(arr+4u*i);
+        else r = (i<128)?tls_slot[i]:0; }
+    else if (idx == gle_idx || (gle_idx == 0xFFFFFFFFu && !strcmp(n,"GetLastError") && (gle_idx = idx, 1))){
+        r = win32_get_last_error(c); }
+    else if (idx == sle_idx || (sle_idx == 0xFFFFFFFFu && !strcmp(n,"SetLastError") && (sle_idx = idx, 1))){
+        win32_set_last_error(c, ARG(c,0)); r = 0; }
     else if (!strcmp(n,"GetVersion"))            r = 0x0A280105u;      /* 5.1.2600 */
     else if (!strcmp(n,"GetModuleHandleA"))      r = 0x00400000u;
     else if (!strcmp(n,"GetProcessHeap"))        r = 0x00000001u;

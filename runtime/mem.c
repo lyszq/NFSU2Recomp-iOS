@@ -31,20 +31,65 @@ __attribute__((weak)) void watch_report_change(uint32_t ip, uint32_t o, uint32_t
     (void)ip;(void)o;(void)n;
 }
 void mprot_arm(uint32_t);
-/* WATCHADDR is a startup diagnostic setting, like the other cached runtime
- * environment options. Parse it once instead of scanning environ on every
- * resource/guest-heap commit, including ordinary runs where it is absent. */
-static pthread_once_t g_commit_watch_once = PTHREAD_ONCE_INIT;
+extern uint8_t *g_mprot_page;
+/* Runtime environment variables and page size are startup diagnostics.
+ * Parse them once with pthread_once instead of scanning environ on hot paths
+ * or signal handlers. */
+static pthread_once_t g_env_once = PTHREAD_ONCE_INIT;
 static uint32_t g_commit_watch_target;
 static int g_commit_watch_enabled, g_commit_watch_done;
-static void commit_watch_init(void){
-    const char *value=getenv("WATCHADDR");
-    if (value){
-        g_commit_watch_target=(uint32_t)strtoul(value,0,0);
-        g_commit_watch_enabled=1;
+static int g_cached_mprot_persist;
+static int g_cached_mprot_hard;
+static int g_cached_mprot_any;
+static int g_cached_itrace_dump;
+static int g_cached_itrace_val;
+static size_t g_host_page_size;
+
+static void env_cache_init(void){
+    const char *wa = getenv("WATCHADDR");
+    if (wa){
+        g_commit_watch_target = (uint32_t)strtoul(wa, 0, 0);
+        g_commit_watch_enabled = 1;
     }
+    if (getenv("MPROT_PERSIST")) g_cached_mprot_persist = 1;
+    if (getenv("MPROT_HARD")) g_cached_mprot_hard = 1;
+    if (getenv("MPROT_ANY")) g_cached_mprot_any = 1;
+    const char *it = getenv("ITRACE");
+    if (it){
+        g_cached_itrace_dump = 1;
+        g_cached_itrace_val = atoi(it);
+    }
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) ps = getpagesize();
+    g_host_page_size = (size_t)ps;
 }
+
+static inline int mem_range_all_committed(uint32_t start_pg, uint32_t end_pg){
+    if (start_pg + 1 == end_pg){
+        return (__atomic_load_n(&g_cbits[start_pg >> 3], __ATOMIC_ACQUIRE) &
+                (uint8_t)(1u << (start_pg & 7))) != 0;
+    }
+    uint32_t p = start_pg;
+    while (p < end_pg && (p & 7)){
+        if (!((__atomic_load_n(&g_cbits[p >> 3], __ATOMIC_ACQUIRE) >> (p & 7)) & 1))
+            return 0;
+        p++;
+    }
+    while (p + 8 <= end_pg){
+        if (__atomic_load_n(&g_cbits[p >> 3], __ATOMIC_ACQUIRE) != 0xFFu)
+            return 0;
+        p += 8;
+    }
+    while (p < end_pg){
+        if (!((__atomic_load_n(&g_cbits[p >> 3], __ATOMIC_ACQUIRE) >> (p & 7)) & 1))
+            return 0;
+        p++;
+    }
+    return 1;
+}
+
 void mem_init(void){
+    pthread_once(&g_env_once, env_cache_init);
     int rc = guest_memory_init();
     if (rc){ errno = rc; perror("mmap 4GB"); exit(1); }
 }
@@ -54,6 +99,30 @@ void mem_commit(uint32_t addr, uint32_t size){
     /* Preserve the desktop API's legacy clipping at the end of x86 space. */
     uint64_t length = size;
     if (length > GSZ - addr) length = GSZ - addr;
+
+    pthread_once(&g_env_once, env_cache_init);
+
+    /* Safe hot-path fast path: if g_mem is active, no pending watchpoint in range,
+     * no active mprotect diagnostic page, and every granule in [addr, addr+length)
+     * is already marked committed in g_cbits, return immediately without acquiring
+     * locks or repeating mprotect. */
+    if (__builtin_expect(g_mem != NULL, 1)){
+        uint64_t lo = (uint64_t)addr & ~0x3FFFull;
+        uint64_t hi = ((uint64_t)addr + length + 0x3FFFu) & ~0x3FFFull;
+        if (hi > GSZ) hi = GSZ;
+
+        int watch_pending = g_commit_watch_enabled &&
+            !__atomic_load_n(&g_commit_watch_done, __ATOMIC_RELAXED);
+        int mprot_active = (g_mprot_page != NULL);
+
+        if (!watch_pending && !mprot_active){
+            uint32_t start_pg = (uint32_t)(lo >> 14);
+            uint32_t end_pg = (uint32_t)(hi >> 14);
+            if (mem_range_all_committed(start_pg, end_pg))
+                return;
+        }
+    }
+
     int rc = guest_memory_commit(addr, length);
     if (rc){
         fprintf(stderr,"mem_commit 0x%08x+%u failed: %s\n", addr, size, strerror(rc));
@@ -61,7 +130,6 @@ void mem_commit(uint32_t addr, uint32_t size){
     }
     /* WATCHADDR=<adres>: o adres commit edilir edilmez watchpoint kur.
      * Boylece ilk yazan bile yakalanir. */
-    pthread_once(&g_commit_watch_once,commit_watch_init);
     if (g_commit_watch_enabled &&
         !__atomic_load_n(&g_commit_watch_done,__ATOMIC_RELAXED)){
         uint64_t lo=(uint64_t)addr & ~0x3FFFull;
@@ -97,7 +165,7 @@ static void *mprot_rearm_thread(void *a0){
         /* g_mprot_page kurulu olsa bile yeniden koru: araya giren bir
          * mem_commit korumayi sessizce kaldirmis olabilir. */
         if (g_mprot_target && !g_mprot_found){
-            size_t ps = (size_t)getpagesize();
+            size_t ps = g_host_page_size ? g_host_page_size : (size_t)getpagesize();
             uint8_t *pg = (uint8_t*)((uintptr_t)(g_mem + g_mprot_target) & ~(uintptr_t)(ps-1));
             if (mprotect(pg, ps, PROT_READ) == 0){ g_mprot_page = pg; g_mprot_sz = ps; }
         }
@@ -108,15 +176,16 @@ static void *mprot_rearm_thread(void *a0){
 }
 
 void mprot_arm(uint32_t guest_addr){
+    pthread_once(&g_env_once, env_cache_init);
     /* Apple Silicon'da sayfa 16 KB; hizalama sistem degerinden alinmali. */
-    size_t ps = (size_t)getpagesize();
+    size_t ps = g_host_page_size ? g_host_page_size : (size_t)getpagesize();
     uint8_t *pg = (uint8_t*)((uintptr_t)(g_mem + guest_addr) & ~(uintptr_t)(ps - 1));
     if (mprotect(pg, ps, PROT_READ) != 0){
         fprintf(stderr,"mprot: kurulamadi (%s)\n", strerror(errno)); return;
     }
     g_mprot_page = pg; g_mprot_sz = ps; g_mprot_target = guest_addr;
-    g_mprot_persist = getenv("MPROT_PERSIST") ? 1 : 0;
-    if (getenv("MPROT_HARD")){
+    g_mprot_persist = g_cached_mprot_persist;
+    if (g_cached_mprot_hard){
         static pthread_t th; static int started = 0;
         if (!started){ started = 1; pthread_create(&th, 0, mprot_rearm_thread, 0); }
     }
@@ -127,7 +196,7 @@ void mprot_arm(uint32_t guest_addr){
 /* Kare basinda korumayi yeniden kur (tek seferlik yakalama yetmiyorsa). */
 void mprot_rearm(void){
     if (!g_mprot_persist || g_mprot_page || !g_mprot_target) return;
-    size_t ps = (size_t)getpagesize();
+    size_t ps = g_host_page_size ? g_host_page_size : (size_t)getpagesize();
     uint8_t *pg = (uint8_t*)((uintptr_t)(g_mem + g_mprot_target) & ~(uintptr_t)(ps - 1));
     if (mprotect(pg, ps, PROT_READ) == 0){ g_mprot_page = pg; g_mprot_sz = ps; }
 }
@@ -148,7 +217,7 @@ static void segv(int sig, siginfo_t *si, void *uc){
             uint32_t ga = (uint32_t)(fa - g_mem);
             int interesting = !g_mprot_target ||
                 (ga >= g_mprot_target && ga < g_mprot_target + 64u);
-            if (getenv("MPROT_ANY")) interesting = 1;   /* mekanizma testi */
+            if (g_cached_mprot_any) interesting = 1;   /* mekanizma testi */
             if (interesting && g_mprot_hits < 12){
                 g_mprot_hits++;
                 fprintf(stderr,"mprot: HEDEFE YAZMA guest 0x%08x  guest fonksiyon=sub_%08x\n",
@@ -192,7 +261,7 @@ static void segv(int sig, siginfo_t *si, void *uc){
                 mem_is_committed(c->ebp+4u) ? MR32(c->ebp+4u) : 0xDEADu);
     }
     if (g_cur_cpu && g_backtrace_fn) g_backtrace_fn(g_cur_cpu, 12);
-    if (g_itrace_dump_fn && getenv("ITRACE")) g_itrace_dump_fn(atoi(getenv("ITRACE")));
+    if (g_itrace_dump_fn && g_cached_itrace_dump) g_itrace_dump_fn(g_cached_itrace_val);
     if (g_report_fn) g_report_fn();
     _exit(3);
 }

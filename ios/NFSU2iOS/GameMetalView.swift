@@ -4,205 +4,6 @@ import GameController
 import QuartzCore
 import UniformTypeIdentifiers
 
-// MARK: - GameController Yöneticisi (DualSense, Xbox, Switch Pro, MFi)
-
-public final class GameControllerManager: ObservableObject {
-    public static let shared = GameControllerManager()
-    
-    @Published public private(set) var connectedControllerName: String? = nil
-    @Published public private(set) var isControllerConnected: Bool = false
-    @Published public private(set) var batteryLevel: Float? = nil
-    
-    private init() {
-        setupObservers()
-        checkForExistingControllers()
-    }
-    
-    private func setupObservers() {
-        let center = NotificationCenter.default
-        
-        center.addObserver(
-            self,
-            selector: #selector(controllerDidConnect(_:)),
-            name: .GCControllerDidConnect,
-            object: nil
-        )
-        
-        center.addObserver(
-            self,
-            selector: #selector(controllerDidDisconnect(_:)),
-            name: .GCControllerDidDisconnect,
-            object: nil
-        )
-        
-        center.addObserver(
-            self,
-            selector: #selector(controllerDidBecomeCurrent(_:)),
-            name: .GCControllerDidBecomeCurrent,
-            object: nil
-        )
-        
-        center.addObserver(
-            self,
-            selector: #selector(controllerDidStopBeingCurrent(_:)),
-            name: .GCControllerDidStopBeingCurrent,
-            object: nil
-        )
-    }
-    
-    @objc private func controllerDidConnect(_ notification: Notification) {
-        if let controller = notification.object as? GCController {
-            configureController(controller)
-        }
-    }
-    
-    @objc private func controllerDidDisconnect(_ notification: Notification) {
-        checkForExistingControllers()
-    }
-    
-    @objc private func controllerDidBecomeCurrent(_ notification: Notification) {
-        if let controller = notification.object as? GCController {
-            configureController(controller)
-        }
-    }
-    
-    @objc private func controllerDidStopBeingCurrent(_ notification: Notification) {
-        checkForExistingControllers()
-    }
-    
-    public func checkForExistingControllers() {
-        if let controller = GCController.current ?? GCController.controllers().first {
-            configureController(controller)
-        } else {
-            DispatchQueue.main.async {
-                self.connectedControllerName = nil
-                self.isControllerConnected = false
-                self.batteryLevel = nil
-            }
-            // Kontrolcü koptuğunda takılı kalan girdileri temizle
-            nfsu2_input_clear_all()
-        }
-    }
-    
-    public func configureController(_ controller: GCController) {
-        let vendor = controller.vendorName ?? "Kablosuz Oyun Kolu"
-        let battery = controller.battery?.batteryLevel
-        
-        DispatchQueue.main.async {
-            self.connectedControllerName = vendor
-            self.isControllerConnected = true
-            self.batteryLevel = battery
-        }
-        
-        // 1. Extended Gamepad (Sony DualSense, DualShock 4, Xbox Series/One, Switch Pro, MFi)
-        if let extended = controller.extendedGamepad {
-            setupExtendedGamepad(extended)
-        } else if let micro = controller.microGamepad {
-            setupMicroGamepad(micro)
-        }
-    }
-    
-    private func setupExtendedGamepad(_ gamepad: GCExtendedGamepad) {
-        // --- Gaz (R2 / RT Tetik) & Fren (L2 / LT Tetik) ---
-        gamepad.rightTrigger.valueChangedHandler = { _, value, _ in
-            nfsu2_input_set_throttle(value)
-        }
-        
-        gamepad.leftTrigger.valueChangedHandler = { _, value, _ in
-            nfsu2_input_set_brake(value)
-        }
-        
-        // --- Direksiyon (Sol Analog Çubuk & D-Pad) ---
-        gamepad.leftThumbstick.xAxis.valueChangedHandler = { _, x in
-            nfsu2_input_set_steering(x)
-        }
-        
-        gamepad.dpad.left.pressedChangedHandler = { _, _, pressed in
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_LEFT), pressed)
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_A), pressed)
-        }
-        
-        gamepad.dpad.right.pressedChangedHandler = { _, _, pressed in
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_RIGHT), pressed)
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_D), pressed)
-        }
-        
-        gamepad.dpad.up.pressedChangedHandler = { _, _, pressed in
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_UP), pressed)
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_W), pressed)
-        }
-        
-        gamepad.dpad.down.pressedChangedHandler = { _, _, pressed in
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_DOWN), pressed)
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_S), pressed)
-        }
-        
-        // --- El Freni (B / Daire & L1 / LB) ---
-        gamepad.buttonB.pressedChangedHandler = { _, _, pressed in
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_SPACE), pressed)
-        }
-        
-        gamepad.leftShoulder.pressedChangedHandler = { _, _, pressed in
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_SPACE), pressed)
-        }
-        
-        // --- NOS / Nitro (X / Kare & R1 / RB) ---
-        gamepad.buttonX.pressedChangedHandler = { _, _, pressed in
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_LSHIFT), pressed)
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_N), pressed)
-        }
-        
-        gamepad.rightShoulder.pressedChangedHandler = { _, _, pressed in
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_LSHIFT), pressed)
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_N), pressed)
-        }
-        
-        // --- Menü / Seç (A / Çarpı) ---
-        gamepad.buttonA.pressedChangedHandler = { _, _, pressed in
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_RETURN), pressed)
-        }
-        
-        // --- Kamera Görünümü (Y / Üçgen) ---
-        gamepad.buttonY.pressedChangedHandler = { _, _, pressed in
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_C), pressed)
-        }
-        
-        // --- Menü / Duraklat (Start / Options / Menu) ---
-        gamepad.buttonMenu.pressedChangedHandler = { _, _, pressed in
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_ESCAPE), pressed)
-        }
-        
-        gamepad.buttonOptions?.pressedChangedHandler = { _, _, pressed in
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_ESCAPE), pressed)
-        }
-        
-        // --- Aracı Sıfırla (L3 / Sol Çubuk Tıklama) ---
-        gamepad.leftThumbstickButton?.pressedChangedHandler = { _, _, pressed in
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_R), pressed)
-        }
-        
-        // --- Arkaya Bak (R3 / Sağ Çubuk Tıklama) ---
-        gamepad.rightThumbstickButton?.pressedChangedHandler = { _, _, pressed in
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_B), pressed)
-        }
-    }
-    
-    private func setupMicroGamepad(_ gamepad: GCMicroGamepad) {
-        gamepad.dpad.xAxis.valueChangedHandler = { _, x in
-            nfsu2_input_set_steering(x)
-        }
-        gamepad.buttonA.pressedChangedHandler = { _, _, pressed in
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_UP), pressed)
-        }
-        gamepad.buttonX.pressedChangedHandler = { _, _, pressed in
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_DOWN), pressed)
-        }
-        gamepad.buttonMenu.pressedChangedHandler = { _, _, pressed in
-            nfsu2_input_set_key(UInt8(NFSU2_DIK_ESCAPE), pressed)
-        }
-    }
-}
-
 // MARK: - Dokunsal Titreşim (Haptics) Yöneticisi
 
 private final class HapticFeedbackEngine {
@@ -236,6 +37,7 @@ public struct MultiTouchKeyButton: View {
     
     @State private var isPressed: Bool = false
     @State private var pressStartTime: Double = 0.0
+    @State private var pressToken: UInt64 = 0
     
     public init(
         icon: String,
@@ -273,6 +75,9 @@ public struct MultiTouchKeyButton: View {
                 if !label.isEmpty {
                     Text(label)
                         .font(.system(size: max(9, size.width * 0.14), weight: .heavy, design: .monospaced))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                        .padding(.horizontal, 2)
                 }
             }
             .foregroundStyle(.white)
@@ -286,6 +91,7 @@ public struct MultiTouchKeyButton: View {
                     if !isPressed {
                         isPressed = true
                         pressStartTime = CACurrentMediaTime()
+                        pressToken &+= 1
                         nfsu2_input_set_key(dikCode, true)
                         if let sec = secondaryDik {
                             nfsu2_input_set_key(sec, true)
@@ -299,10 +105,11 @@ public struct MultiTouchKeyButton: View {
                     let minHoldDuration: Double = 0.050 // 50ms (garantili 3-4 DirectInput polling karesi)
                     let code = dikCode
                     let sec = secondaryDik
+                    let token = pressToken
                     
                     if elapsed < minHoldDuration {
                         DispatchQueue.main.asyncAfter(deadline: .now() + (minHoldDuration - elapsed)) {
-                            if !isPressed {
+                            if !isPressed && pressToken == token {
                                 nfsu2_input_set_key(code, false)
                                 if let s = sec {
                                     nfsu2_input_set_key(s, false)
@@ -317,6 +124,22 @@ public struct MultiTouchKeyButton: View {
                     }
                 }
         )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label.isEmpty ? icon : label)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction {
+            nfsu2_input_set_key(dikCode, true)
+            if let secondaryDik { nfsu2_input_set_key(secondaryDik, true) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                nfsu2_input_set_key(dikCode, false)
+                if let secondaryDik { nfsu2_input_set_key(secondaryDik, false) }
+            }
+        }
+        .onDisappear {
+            isPressed = false
+            nfsu2_input_set_key(dikCode, false)
+            if let secondaryDik { nfsu2_input_set_key(secondaryDik, false) }
+        }
     }
 }
 
@@ -332,6 +155,7 @@ public struct RacingPedalView: View {
     
     @State private var isPressed: Bool = false
     @State private var pressStartTime: Double = 0.0
+    @State private var pressToken: UInt64 = 0
     
     public init(
         label: String,
@@ -395,6 +219,7 @@ public struct RacingPedalView: View {
                     if !isPressed {
                         isPressed = true
                         pressStartTime = CACurrentMediaTime()
+                        pressToken &+= 1
                         nfsu2_input_set_key(dikCode, true)
                         if let sec = secondaryDik {
                             nfsu2_input_set_key(sec, true)
@@ -408,10 +233,11 @@ public struct RacingPedalView: View {
                     let minHoldDuration: Double = 0.050 // 50ms
                     let code = dikCode
                     let sec = secondaryDik
+                    let token = pressToken
                     
                     if elapsed < minHoldDuration {
                         DispatchQueue.main.asyncAfter(deadline: .now() + (minHoldDuration - elapsed)) {
-                            if !isPressed {
+                            if !isPressed && pressToken == token {
                                 nfsu2_input_set_key(code, false)
                                 if let s = sec {
                                     nfsu2_input_set_key(s, false)
@@ -426,6 +252,11 @@ public struct RacingPedalView: View {
                     }
                 }
         )
+        .onDisappear {
+            isPressed = false
+            nfsu2_input_set_key(dikCode, false)
+            if let secondaryDik { nfsu2_input_set_key(secondaryDik, false) }
+        }
     }
 }
 
@@ -535,17 +366,14 @@ public struct AnalogSteerSlider: View {
 // MARK: - Dokunmatik Kontroller Arayüzü (HUD Katmanı)
 
 public struct OnScreenControlsOverlay: View {
-    @ObservedObject var controllerManager = GameControllerManager.shared
     @Binding var showControls: Bool
+    @AppStorage("controls.useSlider") private var useAnalogSlider = true
+    @AppStorage("controls.manualGears") private var showManualGears = false
+    let openSettings: () -> Void
     
-    // Direksiyon Kontrol Modu: Analog Kaydırıcı veya Dijital Tuşlar
-    @State private var useAnalogSlider: Bool = true
-    
-    // Manuel Vites Tuşları Görünürlüğü
-    @State private var showManualGears: Bool = false
-    
-    public init(showControls: Binding<Bool>) {
+    public init(showControls: Binding<Bool>, openSettings: @escaping () -> Void) {
         self._showControls = showControls
+        self.openSettings = openSettings
     }
     
     private var isPad: Bool {
@@ -597,58 +425,16 @@ public struct OnScreenControlsOverlay: View {
                     
                     Spacer()
                     
-                    // Eşleşmiş Kontrolcü Bildirimi
-                    if let controllerName = controllerManager.connectedControllerName {
-                        HStack(spacing: 6) {
-                            Image(systemName: "gamecontroller.fill")
-                                .foregroundStyle(.mint)
-                            Text(controllerName)
-                                .font(.system(size: isPad ? 12 : 10, weight: .bold, design: .monospaced))
-                                .foregroundStyle(.white)
-                            
-                            if let battery = controllerManager.batteryLevel {
-                                Image(systemName: battery > 0.2 ? "battery.75" : "battery.25")
-                                    .foregroundStyle(battery > 0.2 ? .mint : .red)
-                                    .font(.system(size: 11))
-                            }
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .overlay(Capsule().stroke(Color.mint.opacity(0.4), lineWidth: 1))
-                        
-                        Spacer()
-                    }
-                    
-                    // Direksiyon Modu Değiştirici Pill
-                    Button {
-                        useAnalogSlider.toggle()
-                        HapticFeedbackEngine.shared.tapLight()
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: useAnalogSlider ? "steeringwheel" : "dpad")
-                            Text(useAnalogSlider ? "SLIDER" : "D-PAD")
-                                .font(.system(size: 9, weight: .black, design: .monospaced))
-                        }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 6)
-                        .background(Color.white.opacity(0.12), in: Capsule())
-                        .foregroundStyle(.white)
-                    }
-                    
-                    // Dokunmatik Kontrolleri Göster / Gizle Manuel Anahtarı
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.20)) {
-                            showControls.toggle()
-                        }
-                        HapticFeedbackEngine.shared.tapLight()
-                    } label: {
-                        Image(systemName: showControls ? "hand.tap.fill" : "hand.tap")
-                            .font(.system(size: 14, weight: .bold))
-                            .padding(8)
-                            .background(showControls ? Color.mint.opacity(0.3) : Color.white.opacity(0.15), in: Circle())
-                            .foregroundStyle(showControls ? .mint : .white)
-                    }
+                    MultiTouchKeyButton(
+                        icon: "checkmark", label: "ONAY / ATLA",
+                        dikCode: UInt8(NFSU2_DIK_RETURN), tintColor: .mint,
+                        size: topBtnSize
+                    ).accessibilityLabel("Onay veya atla, Enter")
+                    MultiTouchKeyButton(
+                        icon: "arrow.uturn.backward", label: "GERİ",
+                        dikCode: UInt8(NFSU2_DIK_BACK), tintColor: .white,
+                        size: topBtnSize
+                    ).accessibilityLabel("Geri, Backspace")
                     
                     // Duraklat / Menü (ESC)
                     MultiTouchKeyButton(
@@ -658,6 +444,14 @@ public struct OnScreenControlsOverlay: View {
                         tintColor: .yellow,
                         size: topBtnSize
                     )
+                    Button(action: openSettings) {
+                        Image(systemName: "gearshape.fill")
+                            .frame(width: 44, height: 44)
+                            .foregroundStyle(.white)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    .accessibilityLabel("Oyun ve kontrolcü ayarları")
+                    .accessibilityIdentifier("game-settings")
                 }
                 .padding(.horizontal, hPad)
                 .padding(.top, isPad ? 16 : 8)
@@ -790,6 +584,8 @@ public final class NFSU2MetalRenderUIView: UIView {
     // Mouse emulation uses one pointer. Keep its identity stable across UIKit
     // touch batches so a second finger cannot steal movement or release it.
     private var primaryPointerTouch: UITouch?
+    private var pointerTouchStartTime: Double = 0.0
+    private var pointerTouchToken: UInt64 = 0
 #if NFS_FULL_RUNTIME
     private var executablePath: String?
     private var assetRootPath: String?
@@ -804,13 +600,13 @@ public final class NFSU2MetalRenderUIView: UIView {
         super.init(frame: frame)
         backgroundColor = .black
         isOpaque = true
-        contentScaleFactor = UIScreen.main.scale
+        contentScaleFactor = UIScreen.main.nativeScale
         
         let mtl = metalLayer
         mtl.pixelFormat = .bgra8Unorm
         mtl.framebufferOnly = false
         mtl.contentsGravity = .resizeAspect
-        mtl.contentsScale = UIScreen.main.scale
+        mtl.contentsScale = contentScaleFactor
         
 #if NFS_FULL_RUNTIME
         // The strong runtime owns this CAMetalLayer. Attach it on UIKit's
@@ -854,6 +650,7 @@ public final class NFSU2MetalRenderUIView: UIView {
     @objc private func applicationWillResignActive(_ notification: Notification) {
         stopDisplayLink()
         primaryPointerTouch = nil
+        pointerTouchToken &+= 1
         nfsu2_input_clear_all()
         nfsu2_input_set_cursor_available(false)
 #if NFS_FULL_RUNTIME
@@ -864,6 +661,7 @@ public final class NFSU2MetalRenderUIView: UIView {
     @objc private func applicationDidEnterBackground(_ notification: Notification) {
         stopDisplayLink()
         primaryPointerTouch = nil
+        pointerTouchToken &+= 1
         nfsu2_input_clear_all()
         nfsu2_input_set_cursor_available(false)
 #if NFS_FULL_RUNTIME
@@ -880,10 +678,11 @@ public final class NFSU2MetalRenderUIView: UIView {
     
     public override func layoutSubviews() {
         super.layoutSubviews()
-        let scale = UIScreen.main.scale
+        let scale = (window?.screen ?? UIScreen.main).nativeScale
+        contentScaleFactor = scale
         metalLayer.contentsScale = scale
-        let dw = UInt32(bounds.width * scale)
-        let dh = UInt32(bounds.height * scale)
+        let dw = UInt32((bounds.width * scale).rounded())
+        let dh = UInt32((bounds.height * scale).rounded())
         if dw > 0 && dh > 0 {
             metalLayer.drawableSize = CGSize(width: CGFloat(dw), height: CGFloat(dh))
             metal_resize(dw, dh)
@@ -1043,6 +842,8 @@ public final class NFSU2MetalRenderUIView: UIView {
         super.touchesBegan(touches, with: event)
         guard primaryPointerTouch == nil, let touch = touches.first else { return }
         primaryPointerTouch = touch
+        pointerTouchStartTime = CACurrentMediaTime()
+        pointerTouchToken &+= 1
         refreshInputViewport()
         let loc = touch.location(in: self)
         nfsu2_input_set_cursor(Float(loc.x), Float(loc.y), true)
@@ -1062,13 +863,27 @@ public final class NFSU2MetalRenderUIView: UIView {
         guard let touch = primaryPointerTouch, touches.contains(touch) else { return }
         refreshInputViewport()
         let loc = touch.location(in: self)
-        nfsu2_input_set_cursor(Float(loc.x), Float(loc.y), false)
+        let x = Float(loc.x)
+        let y = Float(loc.y)
+        let elapsed = CACurrentMediaTime() - pointerTouchStartTime
+        let minHoldDuration: Double = 0.050
+        let token = pointerTouchToken
         primaryPointerTouch = nil
+        if elapsed < minHoldDuration {
+            nfsu2_input_set_cursor(x, y, true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + (minHoldDuration - elapsed)) { [weak self] in
+                guard let self, self.pointerTouchToken == token, self.primaryPointerTouch == nil else { return }
+                nfsu2_input_set_cursor(x, y, false)
+            }
+        } else {
+            nfsu2_input_set_cursor(x, y, false)
+        }
     }
 
     public override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesCancelled(touches, with: event)
         guard let touch = primaryPointerTouch, touches.contains(touch) else { return }
+        pointerTouchToken &+= 1
         refreshInputViewport()
         let loc = touch.location(in: self)
         nfsu2_input_set_cursor(Float(loc.x), Float(loc.y), false)
@@ -1123,7 +938,11 @@ public struct GameMetalView: View {
     @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var files: GameFileState
     @StateObject private var controllerManager = GameControllerManager.shared
-    @State private var showTouchOverlay: Bool = true
+    @AppStorage("controls.touchMode") private var touchMode = 0
+    @AppStorage("controls.useSlider") private var useSlider = true
+    @AppStorage("controls.manualGears") private var manualGears = false
+    @State private var showSettings = false
+    @State private var touchGeneration = UUID()
 #if NFS_FULL_RUNTIME
     @State private var startRuntimeRequested = false
     @State private var sessionState = Int32(NFS_GAME_SESSION_IDLE)
@@ -1153,8 +972,37 @@ public struct GameMetalView: View {
     }
 #endif
     
-    // Kullanıcı kontrolcü bağlı olsa bile dokunmatiği zorla açabilir / kapatabilir
-    @State private var userOverrideOverlay: Bool? = nil
+    private var touchControls: Binding<Bool> {
+        Binding(get: { touchMode == 1 || (touchMode == 0 && !controllerManager.isControllerConnected) },
+                set: { touchMode = $0 ? 1 : 2 })
+    }
+
+    private var gameInputSessionActive: Bool {
+#if NFS_FULL_RUNTIME
+        startRuntimeRequested && scenePhase == .active
+#else
+        scenePhase == .active
+#endif
+    }
+
+    private func openSettings() {
+        controllerManager.setMenuOpen(true)
+        nfsu2_input_set_enabled(false)
+        nfsu2_input_clear_all()
+        nfsu2_input_set_cursor_available(false)
+        touchGeneration = UUID()
+        showSettings = true
+    }
+
+    private var settingsPanel: some View {
+#if NFS_FULL_RUNTIME
+        GameSettingsPanel(touchMode: $touchMode, useSlider: $useSlider, manualGears: $manualGears,
+                          runtimeStatus: sessionStatus, runtimeLogURL: runtimeLogURL)
+#else
+        GameSettingsPanel(touchMode: $touchMode, useSlider: $useSlider, manualGears: $manualGears,
+                          runtimeStatus: "Önizleme", runtimeLogURL: nil)
+#endif
+    }
     
     public init() {}
     
@@ -1173,40 +1021,19 @@ public struct GameMetalView: View {
                 .ignoresSafeArea()
 
             if startRuntimeRequested {
-                OnScreenControlsOverlay(showControls: Binding(
-                    get: {
-                        if let overrideValue = userOverrideOverlay {
-                            return overrideValue
-                        }
-                        return !controllerManager.isControllerConnected
-                    },
-                    set: { newValue in
-                        userOverrideOverlay = newValue
-                    }
-                ))
-                VStack {
-                    HStack {
-                        Text(sessionStatus)
-                            .font(.system(.caption2, design: .monospaced, weight: .medium))
-                            .foregroundStyle(sessionState == Int32(NFS_GAME_SESSION_FAILED) ? .red : .white)
-                            .lineLimit(3)
-                            .textSelection(.enabled)
-                            .accessibilityIdentifier("full-runtime-status")
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 7)
-                            .background(.black.opacity(0.66), in: RoundedRectangle(cornerRadius: 9))
-                            .allowsHitTesting(false)
-                        Spacer()
-                        if let url = runtimeLogURL {
-                            ShareLink(item: url) { Image(systemName: "square.and.arrow.up") }
-                                .buttonStyle(.borderedProminent)
-                                .tint(.mint)
-                        }
-                    }
-                    Spacer()
+                if !showSettings {
+                    OnScreenControlsOverlay(showControls: touchControls, openSettings: openSettings)
+                        .id(touchGeneration)
                 }
-                .padding(.top, 8)
-                .padding(.horizontal, 12)
+                if sessionState == Int32(NFS_GAME_SESSION_FAILED) {
+                    VStack(spacing: 12) {
+                        Text("Oyun durdu").font(.headline)
+                        Text(sessionStatus).font(.footnote).textSelection(.enabled)
+                            .accessibilityIdentifier("full-runtime-failure")
+                        Button("Ayarlar ve günlük") { openSettings() }
+                    }
+                    .padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                }
             } else {
                 VStack(spacing: 12) {
                     Text("FULL RUNTIME · GAME FILES IMPORTED")
@@ -1219,6 +1046,9 @@ public struct GameMetalView: View {
                         .frame(maxWidth: 520)
                     Button {
                         startRuntimeRequested = true
+                        nfsu2_input_clear_all()
+                        nfsu2_input_set_enabled(scenePhase == .active)
+                        controllerManager.setActive(scenePhase == .active)
                     } label: {
                         Label("START FULL RUNTIME", systemImage: "play.fill")
                             .fontWeight(.bold)
@@ -1272,37 +1102,44 @@ public struct GameMetalView: View {
             NFSU2MetalSurfaceView()
                 .ignoresSafeArea()
 
-            OnScreenControlsOverlay(showControls: Binding(
-                get: {
-                    if let overrideValue = userOverrideOverlay {
-                        return overrideValue
-                    }
-                    return !controllerManager.isControllerConnected
-                },
-                set: { newValue in
-                    userOverrideOverlay = newValue
-                }
-            ))
+            if !showSettings {
+                OnScreenControlsOverlay(showControls: touchControls, openSettings: openSettings)
+                    .id(touchGeneration)
+            }
 #endif
         }
+        .allowsHitTesting(!showSettings)
+        .sheet(isPresented: $showSettings, onDismiss: {
+            nfsu2_input_clear_all()
+            nfsu2_input_set_enabled(gameInputSessionActive)
+            controllerManager.setMenuOpen(false)
+            touchGeneration = UUID()
+        }) { settingsPanel }
 #if NFS_FULL_RUNTIME
         .gameFileImporter(selection: $activeFileImport) { request, outcome in
             completeGameFolderImport(request, outcome: outcome)
         }
 #endif
         .onAppear {
+            nfsu2_input_set_enabled(gameInputSessionActive && !showSettings)
             controllerManager.checkForExistingControllers()
+            controllerManager.setActive(gameInputSessionActive)
 #if NFS_FULL_RUNTIME
             nfs_game_session_set_active(1)
 #endif
         }
         .onDisappear {
+            nfsu2_input_set_enabled(false)
+            controllerManager.setActive(false)
             nfsu2_input_clear_all()
 #if NFS_FULL_RUNTIME
             nfs_game_session_set_active(0)
 #endif
         }
         .onChange(of: scenePhase) { phase in
+            nfsu2_input_set_enabled(gameInputSessionActive && !showSettings)
+            controllerManager.setActive(gameInputSessionActive)
+            touchGeneration = UUID()
             if phase != .active {
                 // Uygulama arka plana geçtiğinde veya kesintiye uğradığında takılı tuşları sıfırla
                 nfsu2_input_clear_all()
@@ -1316,13 +1153,13 @@ public struct GameMetalView: View {
 #endif
             }
         }
-        .onChange(of: controllerManager.isControllerConnected) { connected in
-            // Fiziksel kontrolcü bağlandığında veya koptuğunda animasyonla dokunmatik katmanı güncelle
-            withAnimation(.easeInOut(duration: 0.25)) {
-                if connected {
-                    userOverrideOverlay = nil // Otomatik moda dön ve gizle
-                }
-            }
+        .onChange(of: touchMode) { _ in
+            nfsu2_input_clear_all()
+            touchGeneration = UUID()
+        }
+        .onChange(of: controllerManager.isControllerConnected) { _ in
+            nfsu2_input_clear_all()
+            touchGeneration = UUID()
         }
     }
 }

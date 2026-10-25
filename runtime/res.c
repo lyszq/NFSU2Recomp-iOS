@@ -61,9 +61,41 @@ static uint32_t dir_first(uint32_t dir, uint32_t *is_dir){
 
 uint64_t g_res_found = 0, g_res_missed = 0;
 
+#define RES_CACHE_SIZE 16
+static struct {
+    uint32_t name;
+    uint32_t type;
+    int      wide;
+    uint32_t leaf;
+    int      valid;
+} s_res_id_cache[RES_CACHE_SIZE];
+static uint32_t s_res_cache_hand = 0;
+
+static void res_cache_put(uint32_t name, uint32_t type, int wide, uint32_t leaf){
+    int idx = (int)(s_res_cache_hand++ & (RES_CACHE_SIZE - 1));
+    s_res_id_cache[idx].name = name;
+    s_res_id_cache[idx].type = type;
+    s_res_id_cache[idx].wide = wide;
+    s_res_id_cache[idx].leaf = leaf;
+    s_res_id_cache[idx].valid = 1;
+}
+
 /* lpName/lpType: yuksek word 0 ise tamsayi kimlik, degilse guest string isaretcisi */
 uint32_t res_find(uint32_t lpName, uint32_t lpType, int wide){
     if (!g_res_dir_va) return 0;
+    if (lpName <= 0xFFFFu && lpType <= 0xFFFFu){
+        for (int i = 0; i < RES_CACHE_SIZE; i++){
+            if (s_res_id_cache[i].valid &&
+                s_res_id_cache[i].name == lpName &&
+                s_res_id_cache[i].type == lpType &&
+                s_res_id_cache[i].wide == wide){
+                uint32_t leaf = s_res_id_cache[i].leaf;
+                if (leaf) g_res_found++;
+                else g_res_missed++;
+                return leaf;
+            }
+        }
+    }
     char nbuf[128], tbuf[128];
     const char *ns = 0, *ts = 0; uint32_t nid = 0, tid = 0;
 
@@ -79,15 +111,38 @@ uint32_t res_find(uint32_t lpName, uint32_t lpType, int wide){
         ns = nbuf;
     } else nid = lpName;
 
-    uint32_t isd = 0;
-    uint32_t td = dir_find(g_res_dir_va, ts, tid, &isd);
-    if (!td || !isd){ g_res_missed++; return 0; }
+    static uint32_t s_last_tid = 0xFFFFFFFFu;
+    static uint32_t s_last_td = 0, s_last_td_isd = 0;
+    uint32_t isd = 0, td = 0;
+    if (!ts && tid == s_last_tid && s_last_td){
+        td = s_last_td; isd = s_last_td_isd;
+    } else {
+        td = dir_find(g_res_dir_va, ts, tid, &isd);
+        if (!ts && td && isd){ s_last_tid = tid; s_last_td = td; s_last_td_isd = isd; }
+    }
+
+    if (!td || !isd){
+        if (lpName <= 0xFFFFu && lpType <= 0xFFFFu) res_cache_put(lpName, lpType, wide, 0);
+        g_res_missed++; return 0;
+    }
     uint32_t nd = dir_find(td, ns, nid, &isd);
-    if (!nd){ g_res_missed++; return 0; }
+    if (!nd){
+        if (lpName <= 0xFFFFu && lpType <= 0xFFFFu) res_cache_put(lpName, lpType, wide, 0);
+        g_res_missed++; return 0;
+    }
     uint32_t leaf = nd;
-    if (isd){ leaf = dir_first(nd, &isd); if (!leaf || isd){ g_res_missed++; return 0; } }
+    if (isd){
+        leaf = dir_first(nd, &isd);
+        if (!leaf || isd){
+            if (lpName <= 0xFFFFu && lpType <= 0xFFFFu) res_cache_put(lpName, lpType, wide, 0);
+            g_res_missed++; return 0;
+        }
+    }
+    if (lpName <= 0xFFFFu && lpType <= 0xFFFFu) res_cache_put(lpName, lpType, wide, leaf);
     g_res_found++;
-    { static int shown=0; if(getenv("VERBOSE") && shown<8){ shown++;
+    { static int shown = 0, verbose = -1;
+      if (verbose < 0) verbose = getenv("VERBOSE") ? 1 : 0;
+      if (verbose && shown < 8){ shown++;
         uint32_t da = g_image_base + MR32(leaf), sz = MR32(leaf+4);
         fprintf(stderr,"  [kaynak] tip=%s%u ad=%s -> VA 0x%08x boyut %u  ilk: %02x %02x %02x %02x (imza %s)\n",
                 ts?"":"#", ts?0u:tid, ns?ns:"(id)", da, sz,

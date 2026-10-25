@@ -473,7 +473,7 @@ static int find_next(FH *f, char *nm, size_t nsz){
     if (f->dir2){
         while ((e = readdir(f->dir2))){
             if (e->d_name[0] == '.') continue;
-            if (f->path1[0]){               /* yazma kokunde zaten verildi */
+            if (f->dir && f->path1[0]){     /* yazma kokunde zaten verildi */
                 char p[1024]; struct stat st;
                 snprintf(p, sizeof p, "%s/%s", f->path1, e->d_name);
                 if (stat(p, &st) == 0) continue; }
@@ -615,23 +615,25 @@ int fileio_call(CPU *c, const char *n, uint32_t *out){
          * gomulu ama klasorde "_en" dosyalari var.  Istenen yoksa
          * "_en" ve eksiz surumu dene.                                   */
         struct stat _st;
-        if (!(flags & O_CREAT) && stat(real, &_st) != 0){
+        static int s_file_log = -1;
+        if (s_file_log < 0) s_file_log = (getenv("VERBOSE") != 0 || getenv("FILELIST") != 0);
+        if (!(flags & O_CREAT) && !ok){
             char alt[1024]; const char *dot = strrchr(real, '.');
             if (dot && dot - real > 3){
                 size_t base = (size_t)(dot - real);
-                const char *sfx[] = { "_en", "", "_dn", "_du", "_sw" };
-                for (int q = 0; q < 5; q++){
-                    /* mevcut dil ekini (varsa) kaldir */
-                    size_t cut = base;
-                    if (base >= 3 && real[base-3] == '_') cut = base - 3;
-                    snprintf(alt, sizeof alt, "%.*s%s%s",
-                             (int)cut, real, sfx[q], dot);
-                    if (stat(alt, &_st) == 0){
-                        if (getenv("VERBOSE") || getenv("FILELIST"))
-                            fprintf(stderr,"  [dosya] dil geri dusumu: \"%s\" -> \"%s\"\n",
-                                    real, alt);
-                        snprintf(real, sizeof real, "%s", alt);
-                        break;
+                if (base >= 3 && real[base-3] == '_'){
+                    size_t cut = base - 3;
+                    const char *sfx[] = { "_en", "", "_dn", "_du", "_sw" };
+                    for (int q = 0; q < 5; q++){
+                        snprintf(alt, sizeof alt, "%.*s%s%s",
+                                 (int)cut, real, sfx[q], dot);
+                        if (stat(alt, &_st) == 0){
+                            if (s_file_log)
+                                fprintf(stderr,"  [dosya] dil geri dusumu: \"%s\" -> \"%s\"\n",
+                                        real, alt);
+                            snprintf(real, sizeof real, "%s", alt);
+                            break;
+                        }
                     }
                 }
             }
@@ -640,8 +642,12 @@ int fileio_call(CPU *c, const char *n, uint32_t *out){
          * oyun videoyu oynatmaya calisip beklerse orada takiliyor. */
         int fd;
         { const char *ext = strrchr(real, '.');
-          const char *nm2 = getenv("NOMOVIES");
-          int movie_mode = (nm2 && *nm2 && *nm2 != '0') ? atoi(nm2) : 0;
+          static int s_movie_mode = -1;
+          if (s_movie_mode < 0){
+              const char *nm2 = getenv("NOMOVIES");
+              s_movie_mode = (nm2 && *nm2 && *nm2 != '0') ? atoi(nm2) : 0;
+          }
+          int movie_mode = s_movie_mode;
           /* mod 3: yalnizca "blank" filmini atla (gercek filmler oynasin) */
           const char *bn2 = strrchr(real, '/'); bn2 = bn2 ? bn2+1 : real;
           if (movie_mode == 3 && !strncasecmp(bn2, "blank", 5)) fd = -1;
@@ -652,13 +658,16 @@ int fileio_call(CPU *c, const char *n, uint32_t *out){
           else if (movie_mode == 3 && !strncasecmp(bn2, "blank", 5)) { }
           else {
               fd = open(real, flags, 0644);
+#ifdef F_RDAHEAD
+              if (fd >= 0 && flags == O_RDONLY) (void)fcntl(fd, F_RDAHEAD, 1);
+#endif
               /* mod 2: acilsin ama bos gorunsun -> oynatici "bitti" desin */
               if (fd >= 0 && movie_mode == 2 && ext &&
                   (!strcasecmp(ext,".vp6") || !strcasecmp(ext,".vp8") ||
                    !strcasecmp(ext,".bik") || !strcasecmp(ext,".mpg")))
                   g_empty_next = 1;
           } }
-        { static int shown=0; if ((getenv("VERBOSE")||getenv("FILELIST")) && shown<200){ shown++;
+        { static int shown=0; if (s_file_log && shown<200){ shown++;
             fprintf(stderr,"  [dosya] CreateFileA(\"%s\") -> \"%s\"  %s\n",
                     GS(pn), real, fd>=0?"ACIK":"BASARISIZ"); } }
         if (fd<0){ g_file_fail++; r=INVALID_HANDLE;

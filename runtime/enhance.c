@@ -85,7 +85,7 @@
 #define RET_CUBE       0x005BA559u
 
 static int    g_init, g_refl = 1;
-static double g_road = 0.5, g_blur = 0.5;
+static double g_road = 0.5, g_blur = 0.5; static float g_blur_f = 0.5f;
 static uint32_t g_mirror = 1024, g_cube = 512;
 static uint32_t g_hits[4];
 static uint32_t g_last_w[4], g_last_h[4];
@@ -107,17 +107,18 @@ static void enh_init(void){
     if ((e = getenv("HD_BLUR"))   && *e) g_blur   = atof(e);
     if (g_blur < 0.0) g_blur = 0.0;
     if (g_blur > 1.0) g_blur = 1.0;
-    if (g_road <= 0.0) g_road = 0.5;
+    if (g_road <= 0.0) g_road = 0.5; g_blur_f = (float)g_blur;
     fprintf(stderr, "[HD] yansima: %s  yol=%.2fx geri tampon  bulaniklik=%.2f  ayna=%u  kup=%u\n",
             g_refl ? "ACIK" : "KAPALI", g_road, g_blur, g_mirror, g_cube);
 }
 
 const char *enh_build_name(void){ return "HD"; }
-float enh_blur(void){ enh_init(); return (float)g_blur; }
+float enh_blur(void){ if (!g_init) enh_init(); return g_blur_f; }
 
 int enh_rt_size(uint32_t ret, uint32_t bb_w, uint32_t bb_h,
                 uint32_t *w, uint32_t *h){
-    enh_init();
+    if (ret != RET_ROAD && ret != RET_ROAD_BLUR && ret != RET_MIRROR && ret != RET_CUBE) return ENH_NONE;
+    if (!g_init) enh_init();
     if (!g_refl) return ENH_NONE;
     int k, kind;
     uint32_t nw, nh;
@@ -126,7 +127,9 @@ int enh_rt_size(uint32_t ret, uint32_t bb_w, uint32_t bb_h,
         /* Beklenen boyut degilse (baska bir surum/yama) dokunma. */
         if (*w != 320u || *h != 240u) return ENH_NONE;
         k  = (ret == RET_ROAD) ? 0 : 1; kind = ENH_ROAD;
-        nw = clampu(bb_w * g_road); nh = clampu(bb_h * g_road);
+        static uint32_t s_lw = 0, s_lh = 0, s_cw = 0, s_ch = 0;
+        if (bb_w != s_lw || bb_h != s_lh){ s_lw = bb_w; s_lh = bb_h; s_cw = clampu(bb_w * g_road); s_ch = clampu(bb_h * g_road); }
+        nw = s_cw; nh = s_ch;
         break;
     case RET_MIRROR:
         if (*w != 256u || *h != 256u) return ENH_NONE;
@@ -155,11 +158,12 @@ void enh_view_setup(uint32_t id, const float *m, uint32_t cam){
     /* VIEWLOG=1: her gorunum kimliginin gorunum matrisi (3x3 + konum),
      * kimlik basina 4000. cagridan sonra bir kez.  Kup yuzu kameralarinin
      * eksenlerini okumak icin. */
-    { static int vl = -1; static unsigned cnt[32]; static unsigned char done[32];
+    static int vl = -1; static unsigned cnt[32]; static unsigned char done[32];
       if (vl < 0) vl = getenv("VIEWLOG") ? 1 : 0;
       if (vl && id < 32u && !done[id] && ++cnt[id] > 4000u){ done[id] = 1;
           fprintf(stderr, "[gorunum %u] sag=(%.3f %.3f %.3f) y=(%.3f %.3f %.3f) ileri=(%.3f %.3f %.3f) P00=%.3f P11=%.3f\n",
-                  id, m[0], m[4], m[8], m[1], m[5], m[9], m[2], m[6], m[10], m[16], m[21]); } }
+                  id, m[0], m[4], m[8], m[1], m[5], m[9], m[2], m[6], m[10], m[16], m[21]); }
+    if (!vl && id != 1u && id != 17u && id != 18u && id != 21u) return;
     /* Kup harita yuzu kameralari (gorunum 16..21) dunya eksenlerine DEGIL
      * baska bir cerceveye hizali (olculdu).  Kup ornekleme vektorunu dunyaya
      * cevirmek icin yuz kameralarinin ileri yonleri: kup +x = gorunum 17,

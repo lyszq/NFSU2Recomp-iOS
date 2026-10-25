@@ -92,14 +92,12 @@ static CpuImportDiag g_cpu_import_diag[MAXCPUS];
 static _Thread_local int tl_diag_slot = -1;
 
 static uint32_t cpu_tid_checked(CPU *c){
-    if (!c || !c->fs_base) return 0;
+    if (!c || !c->fs_base || !g_mem) return 0;
     uint64_t address = (uint64_t)c->fs_base + 0x24u;
-    if (address > UINT32_MAX - 3u) return 0;
-    const uint32_t *p = (const uint32_t *)guest_memory_pointer(
-        (uint32_t)address, sizeof(*p), 0);
-    uint32_t tid = 0;
-    if (p) memcpy(&tid, p, sizeof(tid));
-    return tid;
+    if (address + 4u > GUEST_MEMORY_SIZE) return 0;
+    uint32_t addr32 = (uint32_t)address;
+    if (!mem_is_committed(addr32) || !mem_is_committed(addr32 + 3u)) return 0;
+    return MR32(addr32);
 }
 
 static void reg_cpu(CPU *c){
@@ -169,13 +167,10 @@ void guest_note_import(CPU *c, const char *name, unsigned nargs){
         diag->args_captured = 1;
         uint64_t bytes = (uint64_t)count * sizeof(uint32_t);
         uint64_t end = (uint64_t)c->esp + bytes;
-        if (count && end <= (uint64_t)UINT32_MAX + 1ull){
-            const uint32_t *p = (const uint32_t *)guest_memory_pointer(
-                c->esp, bytes, 0);
-            if (p){
-                memcpy(diag->args, p, (size_t)bytes);
-                diag->valid_args = (1u << count) - 1u;
-            }
+        if (count && g_mem && end <= GUEST_MEMORY_SIZE &&
+            mem_is_committed(c->esp) && mem_is_committed((uint32_t)(end - 1u))){
+            memcpy(diag->args, g_mem + c->esp, (size_t)bytes);
+            diag->valid_args = (1u << count) - 1u;
         }
     }
 }
@@ -592,12 +587,18 @@ static int cs_disabled(void){
 }
 static pthread_mutex_t *cs_for(uint32_t key){
     if (cs_disabled()) return 0;          /* eski davranis: etkisiz stub */
+    static _Thread_local uint32_t tl_last_cs_key = 0;
+    static _Thread_local pthread_mutex_t *tl_last_cs_mtx = 0;
+    if (key && key == tl_last_cs_key && tl_last_cs_mtx) return tl_last_cs_mtx;
     pthread_mutex_lock(&g_cs_tab);
     unsigned h = (key >> 2) % MAXCS;
     for (unsigned i = 0; i < MAXCS; i++){
         unsigned j = (h + i) % MAXCS;
         if (g_cs[j].used && g_cs[j].key == key){
-            pthread_mutex_unlock(&g_cs_tab); return &g_cs[j].m;
+            pthread_mutex_t *m = &g_cs[j].m;
+            pthread_mutex_unlock(&g_cs_tab);
+            tl_last_cs_key = key; tl_last_cs_mtx = m;
+            return m;
         }
         if (!g_cs[j].used){
             pthread_mutexattr_t a;
@@ -606,7 +607,10 @@ static pthread_mutex_t *cs_for(uint32_t key){
             pthread_mutex_init(&g_cs[j].m, &a);
             pthread_mutexattr_destroy(&a);
             g_cs[j].key = key; g_cs[j].used = 1;
-            pthread_mutex_unlock(&g_cs_tab); return &g_cs[j].m;
+            pthread_mutex_t *m = &g_cs[j].m;
+            pthread_mutex_unlock(&g_cs_tab);
+            tl_last_cs_key = key; tl_last_cs_mtx = m;
+            return m;
         }
     }
     pthread_mutex_unlock(&g_cs_tab);
@@ -616,7 +620,7 @@ static pthread_mutex_t *cs_for(uint32_t key){
 uint32_t call_guest(CPU *c, uint32_t fn, int nargs, const uint32_t *args);
 static uint32_t g_wndproc = 0;
 static uint32_t g_hwnd    = 0x00B00001u;
-#define WMQ 8
+#define WMQ 64
 static struct { uint32_t msg, wp, lp; } g_wmq[WMQ];
 static int g_wmq_head = 0, g_wmq_tail = 0;
 static int g_wm_activated = 0;
@@ -633,6 +637,83 @@ static int wm_pop(uint32_t *m, uint32_t *wp, uint32_t *lp){
     *m = g_wmq[g_wmq_head].msg; *wp = g_wmq[g_wmq_head].wp; *lp = g_wmq[g_wmq_head].lp;
     g_wmq_head = (g_wmq_head + 1) % WMQ;
     return 1;
+}
+
+void metal_get_cursor(int *x, int *y);
+void metal_fill_mouse(uint8_t *out, unsigned cb);
+void metal_fill_keyboard(uint8_t *out, unsigned cb);
+
+static int win32_vk_is_down(uint32_t vk, const uint8_t *ks, const uint8_t *ms){
+    switch (vk){
+        case 0x01u: return ms[12] != 0;                              /* VK_LBUTTON */
+        case 0x02u: return ms[13] != 0;                              /* VK_RBUTTON */
+        case 0x08u: return ks[0x0E] != 0;                            /* VK_BACK */
+        case 0x09u: return ks[0x0F] != 0;                            /* VK_TAB */
+        case 0x0Du: return ks[0x1C] != 0 || ks[0x9C] != 0;           /* VK_RETURN */
+        case 0x10u: return ks[0x2A] != 0 || ks[0x36] != 0;           /* VK_SHIFT */
+        case 0x11u: return ks[0x1D] != 0 || ks[0x9D] != 0;           /* VK_CONTROL */
+        case 0x12u: return ks[0x38] != 0 || ks[0xB8] != 0;           /* VK_MENU */
+        case 0x1Bu: return ks[0x01] != 0;                            /* VK_ESCAPE */
+        case 0x20u: return ks[0x39] != 0;                            /* VK_SPACE */
+        case 0x25u: return ks[0xCB] != 0;                            /* VK_LEFT */
+        case 0x26u: return ks[0xC8] != 0;                            /* VK_UP */
+        case 0x27u: return ks[0xCD] != 0;                            /* VK_RIGHT */
+        case 0x28u: return ks[0xD0] != 0;                            /* VK_DOWN */
+        case 0xA0u: return ks[0x2A] != 0;                            /* VK_LSHIFT */
+        case 0xA1u: return ks[0x36] != 0;                            /* VK_RSHIFT */
+        case 0xA2u: return ks[0x1D] != 0;                            /* VK_LCONTROL */
+        case 0xA3u: return ks[0x9D] != 0;                            /* VK_RCONTROL */
+        default: break;
+    }
+    return 0;
+}
+
+static void wm_poll_input(void){
+    if (!g_wm_activated) return;
+    static int last_mx = -1, last_my = -1, last_ldown = 0;
+    static uint8_t last_key_down[8] = {0};
+    int mx = 0, my = 0;
+    uint8_t ms[20] = {0};
+    uint8_t ks[256] = {0};
+    metal_get_cursor(&mx, &my);
+    metal_fill_mouse(ms, sizeof(ms));
+    metal_fill_keyboard(ks, sizeof(ks));
+
+    int ldown = (ms[12] != 0);
+    uint32_t lp = ((uint32_t)(uint16_t)my << 16) | (uint32_t)(uint16_t)mx;
+    uint32_t wp_mouse = ldown ? 1u : 0u; /* MK_LBUTTON = 0x0001 */
+
+    if (last_mx < 0){
+        last_mx = mx;
+        last_my = my;
+    } else if (mx != last_mx || my != last_my){
+        last_mx = mx;
+        last_my = my;
+        wm_push(0x0200u, wp_mouse, lp); /* WM_MOUSEMOVE */
+    }
+    if (ldown != last_ldown){
+        last_ldown = ldown;
+        wm_push(ldown ? 0x0201u : 0x0202u, wp_mouse, lp); /* WM_LBUTTONDOWN / WM_LBUTTONUP */
+    }
+
+    static const struct { uint8_t dik; uint8_t vk; } k_nav[8] = {
+        { 0x1Cu, 0x0Du }, /* DIK_RETURN -> VK_RETURN */
+        { 0x01u, 0x1Bu }, /* DIK_ESCAPE -> VK_ESCAPE */
+        { 0x0Eu, 0x08u }, /* DIK_BACK   -> VK_BACK   */
+        { 0x39u, 0x20u }, /* DIK_SPACE  -> VK_SPACE  */
+        { 0xC8u, 0x26u }, /* DIK_UP     -> VK_UP     */
+        { 0xD0u, 0x28u }, /* DIK_DOWN   -> VK_DOWN   */
+        { 0xCBu, 0x25u }, /* DIK_LEFT   -> VK_LEFT   */
+        { 0xCDu, 0x27u }, /* DIK_RIGHT  -> VK_RIGHT  */
+    };
+    for (unsigned i = 0; i < 8u; i++){
+        uint8_t down = (ks[k_nav[i].dik] & 0x80u) ? 1u : 0u;
+        if (down != last_key_down[i]){
+            last_key_down[i] = down;
+            uint32_t klp = ((uint32_t)k_nav[i].dik << 16) | (down ? 1u : 0xC0000001u);
+            wm_push(down ? 0x0100u : 0x0101u, (uint32_t)k_nav[i].vk, klp); /* WM_KEYDOWN / WM_KEYUP */
+        }
+    }
 }
 
 static uint32_t cur_tid(CPU *c){
@@ -1066,12 +1147,62 @@ static void reg_put_string(const char *nm, const char *v){
     g_reg[i].is_str = 1; snprintf(g_reg[i].sv, 128, "%s", v); reg_save();
 }
 
+#if TARGET_OS_IPHONE
+/* Fresh iOS profiles start with the checked NFSRef full-detail values. These are
+ * the game's own registry settings: racing resolution row 3 is ROW_NATIVE in
+ * com.c; the reference profile stores world LOD 3 and car LOD 1. Because
+ * NotFirstTime=1 bypasses sub_005be880's preset init and goes directly to
+ * sub_005bea30's 27-key registry loader, all 27 keys must be provided so
+ * unpopulated settings do not remain at their .bss zero (OFF) state. Missing
+ * values are saved once so later launches keep user changes. */
+static int reg_default_graphics_dword(const char *name, uint32_t *value){
+    static const struct { const char *key; uint32_t val; } k_defaults[] = {
+        { "g_RacingResolution",            3u },
+        { "g_WorldLodLevel",               3u },
+        { "g_CarLodLevel",                 1u },
+        { "g_PerformanceLevel",            5u },
+        { "g_CarEnvironmentMapEnable",     3u },
+        { "g_CarEnvironmentMapUpdateData", 1u },
+        { "g_CarShadowEnable",             2u },
+        { "g_CarHeadlightEnable",          1u },
+        { "g_CarLightingEnable",           0u },
+        { "g_CarDamageEnable",             0u },
+        { "g_CrowdEnable",                 1u },
+        { "g_RoadReflectionEnable",        3u },
+        { "g_FogEnable",                   1u },
+        { "g_MotionBlurEnable",            1u },
+        { "g_LightStreaksEnable",          1u },
+        { "g_LightGlowEnable",             1u },
+        { "g_AnimatedTextureEnable",       1u },
+        { "g_ParticleSystemEnable",        1u },
+        { "g_DepthOfFieldEnable",          1u },
+        { "g_OverBrightEnable",            1u },
+        { "g_BleachByPassEnable",          1u },
+        { "g_TintingEnable",               1u },
+        { "g_FSAALevel",                   0u },
+        { "g_HorizonFogEnable",            1u },
+        { "g_RainEnable",                  1u },
+        { "g_TextureFiltering",            2u },
+        { "g_VSyncOn",                     0u },
+    };
+    for (unsigned i = 0; i < sizeof(k_defaults) / sizeof(k_defaults[0]); i++){
+        if (!strcasecmp(name, k_defaults[i].key)){
+            *value = k_defaults[i].val;
+            return 1;
+        }
+    }
+    return 0;
+}
+#endif
+
 int win32_ext_call(CPU *c, const char *n, uint32_t *out){
     uint32_t r = 0;
+    static int s_reglog = -1;
+    if (s_reglog < 0) s_reglog = getenv("REGLOG") != 0;
     /* --- Registry --- */
     if (!strcmp(n,"RegOpenKeyA")){ uint32_t p=A(c,2); if(p) MR32(p)=obj_new(OB_KEY); r=ERROR_SUCCESS; }
     else if (!strcmp(n,"RegOpenKeyExA")){
-        if (getenv("REGLOG")){ uint32_t sp=A(c,1);
+        if (s_reglog){ uint32_t sp=A(c,1);
             fprintf(stderr,"  [kayit] OpenKeyEx(\"%s\")\n",
                     (sp && mem_is_committed(sp)) ? (const char*)(g_mem+sp) : "(null)"); }
         uint32_t p=A(c,4); if(p) MR32(p)=obj_new(OB_KEY); r=ERROR_SUCCESS; }
@@ -1085,7 +1216,7 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
         uint32_t nameptr=A(c,1), ptype=A(c,3), pdata=A(c,4), pcb=A(c,5);
         const char *vn = (nameptr && mem_is_committed(nameptr))
                          ? (const char*)(g_mem+nameptr) : "";
-        if (getenv("REGLOG"))
+        if (s_reglog)
             fprintf(stderr,"  [kayit] QueryValue(\"%s\")\n", vn);
 
         const char *sval = 0; uint32_t dval = 0; int have_d = 0;
@@ -1102,6 +1233,11 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
         else if (!strcasecmp(vn,"StreamingInstall")){ dval=0; have_d=1; }
         else if (!strcasecmp(vn,"VERSION"))       sval="1.2.0.0";
         else if (!strcasecmp(vn,"SIZE")){ dval=0; have_d=1; }
+#if TARGET_OS_IPHONE
+        else if (reg_default_graphics_dword(vn, &dval)){
+            reg_put_dword(vn, dval); have_d=1;
+        }
+#endif
 
         if (sval){
             uint32_t need = (uint32_t)strlen(sval) + 1u;
@@ -1203,12 +1339,14 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
         /* MSG: +0 hwnd +4 message +8 wParam +12 lParam +16 time +20 pt */
         uint32_t pm=A(c,0), m=0, wp=0, lp=0;
         int remove = !strcmp(n,"GetMessageA") ? 1 : (A(c,4) & 1u);
+        wm_poll_input();
         if (g_wmq_head != g_wmq_tail){
             if (remove) wm_pop(&m,&wp,&lp);
             else { m=g_wmq[g_wmq_head].msg; wp=g_wmq[g_wmq_head].wp; lp=g_wmq[g_wmq_head].lp; }
             if (pm){ mem_commit(pm,28);
+                int mx=0, my=0; metal_get_cursor(&mx, &my);
                 MR32(pm)=g_hwnd; MR32(pm+4)=m; MR32(pm+8)=wp; MR32(pm+12)=lp;
-                MR32(pm+16)=0; MR32(pm+20)=0; MR32(pm+24)=0; }
+                MR32(pm+16)=0; MR32(pm+20)=(uint32_t)mx; MR32(pm+24)=(uint32_t)my; }
             g_wm_sent++;
             r=1;
         } else {
@@ -1228,8 +1366,40 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
            ||!strcmp(n,"SendMessageA")||!strcmp(n,"PostQuitMessage")) r=0;
     else if (!strcmp(n,"ReleaseCapture")||!strcmp(n,"SetCapture")) r=1;
     else if (!strcmp(n,"IsIconic")) r=0;
-    else if (!strcmp(n,"GetKeyboardState")){ uint32_t p=A(c,0); if(p){mem_commit(p,256);memset(g_mem+p,0,256);} r=1; }
-    else if (!strcmp(n,"GetAsyncKeyState")) r=0;
+    else if (!strcmp(n,"GetKeyboardState")){
+        uint32_t p=A(c,0);
+        if(p){
+            uint8_t ks[256]={0}, ms[20]={0};
+            metal_fill_keyboard(ks, sizeof(ks));
+            metal_fill_mouse(ms, sizeof(ms));
+            mem_commit(p,256);
+            memset(g_mem+p,0,256);
+            static const uint8_t k_vks[] = {
+                0x01u, 0x02u, 0x08u, 0x09u, 0x0Du, 0x10u, 0x11u, 0x12u,
+                0x1Bu, 0x20u, 0x25u, 0x26u, 0x27u, 0x28u, 0xA0u, 0xA1u, 0xA2u, 0xA3u
+            };
+            for (unsigned i = 0; i < sizeof(k_vks); i++){
+                uint8_t vk = k_vks[i];
+                if (win32_vk_is_down(vk, ks, ms)) g_mem[p + vk] = 0x80u;
+            }
+        }
+        r=1;
+    }
+    else if (!strcmp(n,"GetAsyncKeyState")||!strcmp(n,"GetKeyState")){
+        uint32_t vk = A(c,0) & 0xFFu;
+        uint8_t ks[256]={0}, ms[20]={0};
+        metal_fill_keyboard(ks, sizeof(ks));
+        metal_fill_mouse(ms, sizeof(ms));
+        int down = win32_vk_is_down(vk, ks, ms);
+        if (!strcmp(n,"GetAsyncKeyState")){
+            static uint8_t async_prev[256] = {0};
+            int edge = down && !async_prev[vk];
+            async_prev[vk] = (uint8_t)down;
+            r = down ? (0x8000u | (edge ? 1u : 0u)) : 0u;
+        } else {
+            r = down ? 0xFF80u : 0u;
+        }
+    }
     /* --- senkronizasyon --- */
     else if (!strcmp(n,"CreateEventA")){
         uint32_t h=obj_new(OB_EVENT); Obj*o=obj_get(h);
@@ -1592,7 +1762,9 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
         /* (uDelay, uResolution, lpTimeProc, dwUser, fuEvent) */
         uint32_t delay=A(c,0), proc=A(c,2), user=A(c,3), flags=A(c,4);
         uint32_t id=0;
-        if (proc && !getenv("NOTIMER")){
+        static int s_notimer = -1;
+        if (s_notimer < 0) s_notimer = getenv("NOTIMER") != 0;
+        if (proc && !s_notimer){
             pthread_mutex_lock(&g_lock);
             int timer_ready = 1;
             if (!g_timer_running){

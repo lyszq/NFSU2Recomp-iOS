@@ -88,7 +88,7 @@ static void update_rate_ratio(void){
 
 #define OUT_CH     AUDIO_OUT_CHANNELS
 #define NBUF       6
-#define FRAMES     2048
+#define FRAMES     4096
 #define WRITE_LEAD_MS 50u
 
 #define MAXSND     AUDIO_MAX_BUFFERS
@@ -103,6 +103,7 @@ typedef struct {
     float    vol;             /* 0..1 */
     uint32_t wpos;            /* oyunun yazdigi son baytin bitisi */
     int      wseen;           /* hic yazma gorduk mu */
+    uint32_t stream_writes;
     uint32_t diag_write_end_offset;
     uint32_t diag_last_write_bytes;
     int      diag_write_seen;
@@ -379,7 +380,7 @@ int audio_register(uint32_t data, uint32_t bytes, uint32_t rate,
         b->pcm = pcm;
         b->chans = chans; b->bits = bits;
         b->used = 1; b->playing = 0; b->loop = 0; b->cursor = 0.0; b->vol = 1.f;
-        b->wpos = 0; b->wseen = 0; b->trim = 1.0; b->target = 0.0; b->over = 0;
+        b->wpos = 0; b->wseen = 0; b->stream_writes = 0; b->trim = 1.0; b->target = 0.0; b->over = 0;
         b->diag_write_end_offset = b->diag_last_write_bytes = 0;
         b->diag_write_seen = 0;
         b->diag_write_calls = b->diag_write_bytes = 0;
@@ -420,7 +421,11 @@ void audio_play(int id, int loop){
 void audio_stop(int id){
     if (id <= 0 || id >= MAXSND) return;
     pthread_mutex_lock(&g_slock);
-    if (g_snd[id].used){ g_snd[id].playing = 0; audio_count(&g_snd[id].stops); }
+    if (g_snd[id].used){
+        g_snd[id].playing = 0;
+        g_snd[id].stream_writes = 0;
+        audio_count(&g_snd[id].stops);
+    }
     pthread_mutex_unlock(&g_slock);
 }
 
@@ -432,6 +437,7 @@ int audio_set_position(int id, uint32_t byte_pos){
     uint32_t bpf = b->chans * (b->bits / 8u);
     if (b->used && b->bytes && bpf && byte_pos < b->bytes){
         b->cursor = (double)byte_pos / (double)bpf;
+        b->stream_writes = 0;
         ok = 1;
     }
     pthread_mutex_unlock(&g_slock);
@@ -546,6 +552,9 @@ void audio_note_write_stat(int id, uint32_t n, int nonzero){
         for (int i = 1; i < g_sndn; i++){
             SndBuf *b = &g_snd[i];
             if (!b->used || b->storage_id != storage_id) continue;
+            if (b->playing && n > 0 && n < b->bytes){
+                if (b->stream_writes != UINT32_MAX) b->stream_writes++;
+            }
             if (now && b->diag_last_write_us && now >= b->diag_last_write_us){
                 uint64_t gap = now - b->diag_last_write_us;
                 if (gap > b->diag_max_write_gap_us) b->diag_max_write_gap_us = gap;
@@ -609,6 +618,9 @@ int audio_publish_write(int id, uint32_t p1, uint32_t n1,
                 for (int i = 1; i < g_sndn; i++){
                     SndBuf *b = &g_snd[i];
                     if (!b->used || b->storage_id != target->storage_id) continue;
+                    if (b->playing && reported_bytes > 0 && reported_bytes < b->bytes){
+                        if (b->stream_writes != UINT32_MAX) b->stream_writes++;
+                    }
                     b->wpos = end_offset;
                     b->wseen = 1;
                     b->diag_write_end_offset = end_offset;
@@ -675,6 +687,7 @@ int audio_duplicate(int src){
         g_snd[id] = g_snd[src];
         g_snd[id].playing = 0; g_snd[id].cursor = 0.0; g_snd[id].trim = 1.0;
         g_snd[id].target = 0.0; g_snd[id].over = 0;
+        g_snd[id].stream_writes = 0;
         g_snd[id].plays = g_snd[id].stops = g_snd[id].reissues = 0;
         g_snd[id].wr_bytes = g_snd[id].wr_calls = g_snd[id].wr_nonzero = 0;
     }
@@ -688,10 +701,12 @@ static void audio_cursors_locked(const SndBuf *b, uint32_t *play, uint32_t *writ
         uint32_t bpf = b->chans * (b->bits / 8u);
         uint32_t sz = b->bytes;
         if (bpf){
-            p = (uint32_t)(b->cursor * (double)bpf) % sz;
+            uint32_t raw_p = (uint32_t)(b->cursor * (double)bpf + 1e-6);
+            p = ((raw_p / bpf) * bpf) % sz;
             uint32_t lead = (b->rate * WRITE_LEAD_MS / 1000u) * bpf;
-            if (lead >= sz) lead = sz / 4u;
-            w = (p + lead) % sz;
+            if (lead >= sz) lead = ((sz / 4u) / bpf) * bpf;
+            if (!lead && sz >= bpf) lead = bpf;
+            w = (((p + lead) / bpf) * bpf) % sz;
         }
     }
     if (play) *play = p;
@@ -750,6 +765,7 @@ static void mix_chunk(int16_t *out, unsigned frames, uint32_t hw_rate){
     uint64_t active = 0;
 
     pthread_mutex_lock(&g_slock);
+    uint64_t now_us = audio_monotonic_us();
     for (int i = 1; i < g_sndn; i++){
         SndBuf *b = &g_snd[i];
         if (!b->used || !b->playing || !b->bytes || !b->pcm) continue;
@@ -793,40 +809,103 @@ static void mix_chunk(int16_t *out, unsigned frames, uint32_t hw_rate){
         double step = ((double)b->rate / (double)hw_rate) * g_rate_ratio * b->trim * b->freq;
         active++;
 
-        /* Dogrusal Ara-Degerlemeli (Linear Interpolated) Karistirma */
-        for (unsigned f = 0; f < frames; f++){
-            double sp = b->cursor + step * (double)f;
-            if (sp >= (double)nsrc){
-                if (b->loop){
-                    double source_len = (double)nsrc;
-                    /* The single-wrap interval has an exact subtraction
-                     * remainder; retain fmod for all multi-wrap values. */
-                    if (sp < source_len * 2.0) sp -= source_len;
-                    else sp = fmod(sp, source_len);
-                }
-                else { b->playing = 0; break; }
+        int stalled_stream = 0;
+        if (b->loop && b->stream_writes >= 2u && b->diag_last_write_us > 0 &&
+            now_us > b->diag_last_write_us){
+            uint64_t buf_us = (uint64_t)nsrc * 1000000ull / (b->rate ? b->rate : AUDIO_DEFAULT_RATE);
+            if (buf_us < 250000ull) buf_us = 250000ull;
+            if (now_us - b->diag_last_write_us > buf_us){
+                stalled_stream = 1;
+                audio_count(&b->over);
             }
-            uint32_t si0 = (uint32_t)sp;
-            uint32_t si1 = (si0 + 1 < nsrc) ? (si0 + 1) : (b->loop ? 0 : si0);
-            float alpha = (float)(sp - (double)si0);
+        }
 
-            for (unsigned c = 0; c < OUT_CH; c++){
-                uint32_t sc = (b->chans == 2u) ? (uint32_t)c : 0u;
-                size_t off0 = (size_t)si0 * bpf + sc * bps;
-                size_t off1 = (size_t)si1 * bpf + sc * bps;
-                float s0, s1;
-                if (b->bits == 16u){
-                    int16_t v0, v1;
-                    memcpy(&v0, b->pcm + off0, 2);
-                    memcpy(&v1, b->pcm + off1, 2);
-                    s0 = (float)v0 / 32768.f;
-                    s1 = (float)v1 / 32768.f;
-                } else {
-                    s0 = ((float)b->pcm[off0] - 128.f) / 128.f;
-                    s1 = ((float)b->pcm[off1] - 128.f) / 128.f;
+        if (!stalled_stream){
+            if (b->bits == 16u && b->chans == 2u){
+                const int16_t *pcm16 = (const int16_t *)b->pcm;
+                const float vol_scale = b->vol * (1.0f / 32768.0f);
+                for (unsigned f = 0; f < frames; f++){
+                    double sp = b->cursor + step * (double)f;
+                    if (sp >= (double)nsrc){
+                        if (b->loop){
+                            double source_len = (double)nsrc;
+                            if (sp < source_len * 2.0) sp -= source_len;
+                            else sp = fmod(sp, source_len);
+                        }
+                        else { b->playing = 0; break; }
+                    }
+                    uint32_t si0 = (uint32_t)sp;
+                    uint32_t si1 = (si0 + 1 < nsrc) ? (si0 + 1) : (b->loop ? 0 : si0);
+                    float alpha = (float)(sp - (double)si0);
+
+                    size_t idx0 = (size_t)si0 * 2u;
+                    size_t idx1 = (size_t)si1 * 2u;
+
+                    float s0_l = (float)pcm16[idx0];
+                    float s1_l = (float)pcm16[idx1];
+                    acc[f * OUT_CH + 0] += (s0_l + alpha * (s1_l - s0_l)) * vol_scale;
+
+                    float s0_r = (float)pcm16[idx0 + 1u];
+                    float s1_r = (float)pcm16[idx1 + 1u];
+                    acc[f * OUT_CH + 1] += (s0_r + alpha * (s1_r - s0_r)) * vol_scale;
                 }
-                float sample = s0 + alpha * (s1 - s0);
-                acc[f * OUT_CH + c] += sample * b->vol;
+            } else if (b->bits == 16u && b->chans == 1u){
+                const int16_t *pcm16 = (const int16_t *)b->pcm;
+                const float vol_scale = b->vol * (1.0f / 32768.0f);
+                for (unsigned f = 0; f < frames; f++){
+                    double sp = b->cursor + step * (double)f;
+                    if (sp >= (double)nsrc){
+                        if (b->loop){
+                            double source_len = (double)nsrc;
+                            if (sp < source_len * 2.0) sp -= source_len;
+                            else sp = fmod(sp, source_len);
+                        }
+                        else { b->playing = 0; break; }
+                    }
+                    uint32_t si0 = (uint32_t)sp;
+                    uint32_t si1 = (si0 + 1 < nsrc) ? (si0 + 1) : (b->loop ? 0 : si0);
+                    float alpha = (float)(sp - (double)si0);
+
+                    float s0 = (float)pcm16[si0];
+                    float s1 = (float)pcm16[si1];
+                    float sample = (s0 + alpha * (s1 - s0)) * vol_scale;
+                    acc[f * OUT_CH + 0] += sample;
+                    acc[f * OUT_CH + 1] += sample;
+                }
+            } else {
+                for (unsigned f = 0; f < frames; f++){
+                    double sp = b->cursor + step * (double)f;
+                    if (sp >= (double)nsrc){
+                        if (b->loop){
+                            double source_len = (double)nsrc;
+                            if (sp < source_len * 2.0) sp -= source_len;
+                            else sp = fmod(sp, source_len);
+                        }
+                        else { b->playing = 0; break; }
+                    }
+                    uint32_t si0 = (uint32_t)sp;
+                    uint32_t si1 = (si0 + 1 < nsrc) ? (si0 + 1) : (b->loop ? 0 : si0);
+                    float alpha = (float)(sp - (double)si0);
+
+                    for (unsigned c = 0; c < OUT_CH; c++){
+                        uint32_t sc = (b->chans == 2u) ? (uint32_t)c : 0u;
+                        size_t off0 = (size_t)si0 * bpf + sc * bps;
+                        size_t off1 = (size_t)si1 * bpf + sc * bps;
+                        float s0, s1;
+                        if (b->bits == 16u){
+                            int16_t v0, v1;
+                            memcpy(&v0, b->pcm + off0, 2);
+                            memcpy(&v1, b->pcm + off1, 2);
+                            s0 = (float)v0 / 32768.f;
+                            s1 = (float)v1 / 32768.f;
+                        } else {
+                            s0 = ((float)b->pcm[off0] - 128.f) / 128.f;
+                            s1 = ((float)b->pcm[off1] - 128.f) / 128.f;
+                        }
+                        float sample = s0 + alpha * (s1 - s0);
+                        acc[f * OUT_CH + c] += sample * b->vol;
+                    }
+                }
             }
         }
 
@@ -1261,6 +1340,10 @@ void audio_ios_reconfigure_sample_rate(uint32_t new_rate){
 
     AudioUnitSetProperty(g_au, kAudioUnitProperty_StreamFormat,
                          kAudioUnitScope_Input, 0, &f, sizeof f);
+
+    UInt32 mx = FRAMES;
+    AudioUnitSetProperty(g_au, kAudioUnitProperty_MaximumFramesPerSlice,
+                         kAudioUnitScope_Global, 0, &mx, sizeof mx);
 
     AudioUnitInitialize(g_au);
     AudioOutputUnitStart(g_au);

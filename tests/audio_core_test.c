@@ -308,6 +308,56 @@ static void test_snapshot_buffer_limit_keeps_active_buffers(void){
     assert(active && active->active && active->looping);
 }
 
+static void test_streaming_loop_stall_and_48khz_frame_alignment(void){
+    /* 1. Test 48 kHz fractional cursor sample-frame alignment */
+    reset_audio(48000);
+    int16_t stereo_pcm[64 * 2];
+    for (unsigned i = 0; i < 64 * 2; i++) stereo_pcm[i] = (int16_t)1000;
+    assert(sizeof(stereo_pcm) == 256u);
+    assert(TEST_DATA_A + sizeof(stereo_pcm) <= TEST_MEM_SIZE);
+    memcpy(g_mem + TEST_DATA_A, stereo_pcm, sizeof(stereo_pcm));
+    int id = audio_register(TEST_DATA_A, (uint32_t)sizeof(stereo_pcm), 44100, 2, 16);
+    assert(id > 0);
+
+    int16_t out[32] = {0};
+    audio_play(id, 1);
+    mix_into(out, 7);
+
+    uint32_t play_pos = UINT32_MAX, write_pos = UINT32_MAX;
+    audio_cursors(id, &play_pos, &write_pos);
+    assert((play_pos % 4u) == 0u);
+    assert((write_pos % 4u) == 0u);
+
+    /* 2. Test streaming loop stall suppression during loading screens */
+    reset_audio(48000);
+    int16_t mono_pcm[32];
+    for (unsigned i = 0; i < 32; i++) mono_pcm[i] = 4000;
+    assert(sizeof(mono_pcm) == 64u);
+    write_mono16(TEST_DATA_A, mono_pcm, 32);
+    id = audio_register(TEST_DATA_A, (uint32_t)sizeof(mono_pcm), 44100, 1, 16);
+    assert(id > 0);
+
+    audio_play(id, 1);
+    assert(audio_publish_write(id, TEST_DATA_A, 16u, 0u, 0u, 1));
+    assert(audio_publish_write(id, TEST_DATA_A + 16u, 16u, 0u, 0u, 1));
+
+    pthread_mutex_lock(&g_slock);
+    g_snd[id].diag_last_write_us = 1ull;
+    pthread_mutex_unlock(&g_slock);
+
+    memset(out, 0x55, sizeof(out));
+    mix_into(out, 8);
+    for (unsigned i = 0; i < 8u * 2u; i++){
+        assert(out[i] == 0);
+    }
+    assert(audio_cursor(id) > 0);
+
+    assert(audio_publish_write(id, TEST_DATA_A, 16u, 0u, 0u, 1));
+    memset(out, 0, sizeof(out));
+    mix_into(out, 4);
+    assert(out[0] != 0);
+}
+
 int main(void){
     g_mem = (uint8_t *)calloc(TEST_MEM_SIZE, 1);
     assert(g_mem);
@@ -318,6 +368,7 @@ int main(void){
     test_nonblocking_snapshot();
     test_per_buffer_snapshot();
     test_snapshot_buffer_limit_keeps_active_buffers();
+    test_streaming_loop_stall_and_48khz_frame_alignment();
     free(g_mem);
     puts("audio core tests passed");
     return 0;

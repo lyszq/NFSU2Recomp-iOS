@@ -9,6 +9,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 #include "audio.h"
 #include "guest_lock.h"
 #include "guest_memory.h"
@@ -40,6 +43,22 @@ void metal_begin_frame(void);
 #include "gfx.h"
 #include "vsemu.h"
 #include "enhance.h"
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#include <stdbool.h>
+extern uint32_t nfsu2_input_event_snapshot(uint32_t *cursor);
+extern uint32_t nfsu2_input_event_generation(void);
+extern uint32_t nfsu2_input_event_reset_sequence_base(void);
+extern bool nfsu2_input_event_at(uint32_t cursor, uint32_t index,
+                                uint8_t *dik_code, bool *is_pressed,
+                                uint32_t *timestamp_ms, uint32_t *sequence);
+extern void nfsu2_input_consume_events(uint32_t cursor, uint32_t count);
+extern bool nfsu2_input_event_overflowed(void);
+extern bool nfsu2_input_take_event_overflow(void);
+#define COM_HAS_INPUT_EVENT_QUEUE 1
+#else
+#define COM_HAS_INPUT_EVENT_QUEUE 0
+#endif
 
 /* COM dagitimi metot ADINI karsilastiriyor: kosuda 144 MILYON com_call var
  * ve her biri if-else zincirinde onlarca strcmp yapiyordu (profilde
@@ -148,7 +167,8 @@ static uint32_t ds_lock_match(uint32_t owner, uint32_t p1, uint32_t n1,
     uint32_t best=0;
     for (uint32_t i=g_ds_lock_heads[ds_lock_bucket(owner)]; i; i=g_ds_locks[i].next){
         DSLock *l=&g_ds_locks[i];
-        if (l->owner==owner && l->p1==p1 && l->p2==p2 && n1<=l->n1 && n2<=l->n2 &&
+        if (l->owner==owner && l->p1==p1 && (!n2 ? (!p2 || l->p2==p2) : l->p2==p2) &&
+            n1<=l->n1 && n2<=l->n2 &&
             (!best || (uint64_t)l->n1+l->n2 <
                       (uint64_t)g_ds_locks[best].n1+g_ds_locks[best].n2)) best=i;
     }
@@ -249,13 +269,45 @@ static uint32_t g_ss_vb = 0, g_ss_off = 0, g_ss_stride = 0;
 static uint32_t g_ib_obj = 0;
 static uint32_t g_idx_scratch = 0;
 static uint64_t g_dip_draws = 0, g_dip_skip = 0, g_dip_tris = 0;
-static uint32_t g_act_of_key[256];      /* DIK -> uAppData (0 = bagli degil) */
+static uint32_t g_act_of_key[256];      /* DIK -> uAppData */
 static uint32_t g_act_ofs[256];         /* DIK -> eylem dizisindeki ofset */
+static unsigned char g_act_mapped[256]; /* uAppData==0 da gecerli olabilir */
 static int      g_act_count = 0;
+static int      g_act_map_set = 0;
+static uint32_t g_act_data_size = 0;
 static unsigned char g_kb_prev[256];
 static uint32_t g_di_seq = 1;
+static uint32_t g_di_pending_seq[256];
+static uint32_t g_di_pending_time[256];
+static unsigned char g_di_delivered[256];
+static unsigned char g_di_reset_pending[256];
+static uint32_t g_di_event_generation;
+static uint32_t g_di_reset_sequence_base;
 static uint64_t g_di_events = 0;
 static uint32_t host_us_ms(void){ uint64_t host_us(void); return (uint32_t)(host_us()/1000ull); }
+static void di_rebase_keyboard(const unsigned char *state){
+    for (uint32_t k=0;k<256u;k++) g_kb_prev[k]=state[k]?1u:0u;
+}
+static void di_write_data(uint32_t dst,uint32_t index,uint32_t cb,uint8_t key,
+                          int pressed,uint32_t timestamp,uint32_t sequence){
+    if (!dst) return;
+    uint32_t e=dst+index*cb;
+    mem_commit(e,cb); memset(g_mem+e,0,cb);
+    MR32(e)    = g_act_map_set ? g_act_ofs[key] : key;
+    MR32(e+4)  = pressed ? 0x80u : 0u;
+    MR32(e+8)  = timestamp;
+    MR32(e+12) = sequence;
+    if (cb>=20u && g_act_map_set) MR32(e+16)=g_act_of_key[key];
+}
+static void di_mark_cleared_releases(const unsigned char *state){
+    for (uint32_t k=1;k<256u;k++){
+        if (g_di_delivered[k] && !state[k]){
+            g_di_reset_pending[k]=1;
+            g_di_pending_seq[k]=0;
+            g_di_pending_time[k]=0;
+        }
+    }
+}
 static uint32_t *g_lk_tid=0; static unsigned *g_lk_cnt=0; static uint64_t *g_lk_byt=0;
 static uint32_t *g_lock_obj=0; static unsigned *g_lock_cnt=0; static int g_lock_n=0;
 static uint64_t g_snd_bytes=0, g_snd_nonzero=0, g_snd_zero=0, g_snd_play=0;
@@ -1170,7 +1222,7 @@ static const VSConst *aspect_apply(const VSConst *vsk, const VSProg *prog){
           if (hf){ static VSConst ht; vsk_copy_used(&ht, vsk, prog);
                    for (int k = 0; k < 4; k++) ht.f[cx][k] *= g_aspfix;
                    return &ht; } }
-        if (ENVC("ASPLOG")){ static int no = 0;
+        static int s_asplog = -1; if (s_asplog < 0) s_asplog = getenv("ASPLOG") != NULL; if (s_asplog){ static int no = 0;
             if (no < 6){ no++;
                 fprintf(stderr,"  [asp-orto] vs=%u cx=%d cw=%d  c%d=(%.4f %.4f %.4f %.4f)"
                         "  c%d=(%.4f %.4f %.4f %.4f)\n", vs, cx, cw,
@@ -1181,7 +1233,7 @@ static const VSConst *aspect_apply(const VSConst *vsk, const VSProg *prog){
     static VSConst tmp;
     vsk_copy_used(&tmp, vsk, prog);
     for (int k = 0; k < 4; k++) tmp.f[cx][k] *= g_aspfix;
-    if (ENVC("ASPLOG")){ static int n = 0;
+    static int s_asplog2 = -1; if (s_asplog2 < 0) s_asplog2 = getenv("ASPLOG") != NULL; if (s_asplog2){ static int n = 0;
         if (n < 6){ n++;
             fprintf(stderr,"  [asp] vs=%u c%d=(%.4f %.4f %.4f %.4f) -> (%.4f %.4f %.4f %.4f)"
                     "  c%d=(%.3f %.3f %.3f %.3f)\n", g_cur_vs, cx,
@@ -1326,7 +1378,14 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
                     int gpu_layout_ok; DElem el[16]; } dcc[64];
     uint32_t d = g_cur_decl;
     unsigned dci = (unsigned)(((uintptr_t)prog >> 4) ^ (d >> 3) ^ (d >> 11)) & 63u;
-    int dlog = ENVC("DECLLOG") != NULL;
+    static int s_decllog_on = -1;
+    static int s_decllog_ps = -1;
+    if (s_decllog_on < 0){
+        const char *dl = getenv("DECLLOG");
+        s_decllog_on = dl != NULL;
+        s_decllog_ps = dl ? atoi(dl) : -1;
+    }
+    int dlog = s_decllog_on;
     if (dlog || !dcc[dci].ok || dcc[dci].decl != d || dcc[dci].prog != prog){
     DElem el[16]; int nel = 0;
     int p_off = -1, p_type = 2, c_off = -1, c_type = 4, t_off = -1, t_type = 1;
@@ -1340,8 +1399,8 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
             if (st != 0) continue;                       /* yalnizca akis 0 */
             /* DECLLOG=<ps>: yalnizca o piksel gölgelendiricisiyle cizen
              * bildirimleri, bir kez, TUM elemanlariyla bas. */
-            { const char *dl = ENVC("DECLLOG");
-              if (dl && atoi(dl) == g_cur_ps_id){
+            {
+              if (s_decllog_on && s_decllog_ps == g_cur_ps_id){
                 static uint32_t seen[32]; static int sn = 0; int nw = 1;
                 for (int q=0;q<sn;q++) if (seen[q]==d) nw = 0;
                 if (nw && k == 0 && sn < 32){ seen[sn++] = d;
@@ -1477,10 +1536,11 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
              * matrisle geliyorsa on yuz iki farkli uzay kullaniyor demektir. */
             { int degenerate = (vsk->f[3][3] == 0.f && vsk->f[3][0] == 0.f &&
                                 vsk->f[0][0] == 0.f && vsk->f[1][1] == 0.f);
+              static int s_matlog = -1; if (s_matlog < 0) s_matlog = getenv("MATLOG") != NULL;
               if (degenerate){ g_mat_bad++;
                   static uint32_t seen[8]; static int ns=0;
                   int f4=0; for(int q=0;q<ns;q++) if(seen[q]==g_cur_vs) f4=1;
-                  if(!f4 && ns<8 && ENVC("MATLOG")){ seen[ns++]=g_cur_vs;
+                  if(!f4 && ns<8 && s_matlog){ seen[ns++]=g_cur_vs;
                       fprintf(stderr,"  [matris-BOZUK] shader=%u doku=%u son yukleme sr=%u n=%u pd=%08x\n",
                               g_cur_vs, g_cur_tex,
                               g_scn?g_sc[(g_scn-1)&7].sr:0,
@@ -1490,7 +1550,7 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
                   g_mat_ok++;
                   static uint32_t seenok[8]; static int nsok=0;
                   int f5=0; for(int q=0;q<nsok;q++) if(seenok[q]==g_cur_vs) f5=1;
-                  if(!f5 && nsok<8 && ENVC("MATLOG")){ seenok[nsok++]=g_cur_vs;
+                  if(!f5 && nsok<8 && s_matlog){ seenok[nsok++]=g_cur_vs;
                       fprintf(stderr,"  [matris-GECERLI] shader=%u doku=%u pd=%08x\n",
                               g_cur_vs, g_cur_tex, g_scn?g_sc[(g_scn-1)&7].pd:0); }
                   static int shown = 0;
@@ -1579,7 +1639,7 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
       metal_set_stage_tex(g_tex_stage[1], g_tex_stage[2], g_tex_stage[3]);
       metal_set_ps(g_cur_ps_id, &g_psc[0][0]);
       texproj_push(); smp_push();
-      if (ENVC("PSC0")){ static int n5=0;
+      static int s_psc0 = -1; if (s_psc0 < 0) s_psc0 = getenv("PSC0") != NULL; if (s_psc0){ static int n5=0;
           if (n5<6 && g_tex_stage[1]){ n5++;
               fprintf(stderr,"  [ps] ps=%d c0=(%.3f %.3f %.3f %.3f) doku=%u/%u/%u/%u\n",
                       g_cur_ps_id,
@@ -1590,7 +1650,7 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
     { int nstage=0; for(int q=0;q<4;q++) if (g_tex_stage[q]) nstage++;
       if (nstage>0 && nstage<=4) g_stage_hist[nstage-1]++;
       static int shown=0;
-      if (ENVC("STAGEDUMP") && nstage>=2 && shown<8){ shown++;
+      static int s_stagedump = -1; if (s_stagedump < 0) s_stagedump = getenv("STAGEDUMP") != NULL; if (s_stagedump && nstage>=2 && shown<8){ shown++;
           fprintf(stderr,"  [asama] cizim: doku0=%u doku1=%u doku2=%u doku3=%u  kose=%u\n",
                   g_tex_stage[0],g_tex_stage[1],g_tex_stage[2],g_tex_stage[3], nv); } }
     g_t_draw_ns += now_ns() - _t0; g_v_xform += nv;
@@ -1967,7 +2027,14 @@ int com_call(CPU *c, uint32_t magic){
     if (g_dxrec_depth) dxrec_note(c, (int)iface, mid, nargs);
     if (g_fxtr && fxtr_now()) fxtr_dev(c, (int)iface, mid, nargs, nm);
     /* ZSEQ=<kare>: o karede hedef / Z yuzeyi / Clear / Z durumu sirasi (tani) */
-    if (iface==IF_DEV && ENVC("ZSEQ") && g_present_no == (uint32_t)atoi(ENVC("ZSEQ"))){
+    static int s_zseq_on = -1;
+    static uint32_t s_zseq_val = 0;
+    if (s_zseq_on < 0){
+        const char *e = getenv("ZSEQ");
+        s_zseq_on = e != NULL;
+        s_zseq_val = e ? (uint32_t)atoi(e) : 0;
+    }
+    if (iface==IF_DEV && s_zseq_on && g_present_no == s_zseq_val){
         static unsigned nd = 0;
         if (nm[0]=='D' && nm[1]=='r'){ nd++; }
         else if (MID(SetRenderTarget) || MID(SetDepthStencilSurface) || MID(Clear)
@@ -2201,7 +2268,7 @@ int com_call(CPU *c, uint32_t magic){
                 g_smp_raw[sm][ty] = val;
                 if (sm<4u) g_smp_pending |= 1u << sm;
             }
-            if (ENVC("SMPLOG") && sm < 4u && ty < 20u){
+            static int s_smplog = -1; if (s_smplog < 0) s_smplog = getenv("SMPLOG") != NULL; if (s_smplog && sm < 4u && ty < 20u){
                 static uint32_t seen[4][20];
                 if (seen[sm][ty] != val + 1u){ seen[sm][ty] = val + 1u;
                     const char *tn = ty==1?"ADDRESSU":ty==2?"ADDRESSV":ty==3?"ADDRESSW":
@@ -2221,7 +2288,7 @@ int com_call(CPU *c, uint32_t magic){
             /* CUBELOG=1: kup dokunun gercekten baglanip baglanmadigini olc.
              * Metal tarafinda kup destegi YOK (duz 2B yaratiliyor); once
              * bu yolun kullanildigini dogrula. */
-            if (ENVC("CUBELOG") && A(c,2) && is_cube_tex(A(c,2))){
+            static int s_cubelog_tex = -1; if (s_cubelog_tex < 0) s_cubelog_tex = getenv("CUBELOG") != NULL; if (s_cubelog_tex && A(c,2) && is_cube_tex(A(c,2))){
                 static unsigned n2 = 0;
                 if (n2 < 8){ n2++;
                     fprintf(stderr,"  [kup] SetTexture asama=%u doku=0x%08x vs=%u\n",
@@ -2389,7 +2456,7 @@ int com_call(CPU *c, uint32_t magic){
              * sayfayi salt-okunur yap; sonraki karenin yazani yakalanir. */
             /* PDLIST: farkli pd degerlerini ve matrisin bozuk olup
              * olmadigini listele.  Iyi/bozuk blok karsilastirmasi icin. */
-            if (ENVC("PDLIST") && sr==0 && n>=4 && pd && mem_is_committed(pd+63)){
+            static int s_pdlist = -1; if (s_pdlist < 0) s_pdlist = getenv("PDLIST") != NULL; if (s_pdlist && sr==0 && n>=4 && pd && mem_is_committed(pd+63)){
                 static uint32_t seen[32]; static int ns=0;
                 int f=0; for (int q=0;q<ns;q++) if (seen[q]==pd) f=1;
                 if (!f && ns<32){ seen[ns++]=pd;
@@ -2400,7 +2467,7 @@ int com_call(CPU *c, uint32_t magic){
                 }
             }
             /* OWNERSCAN: obekte pd'yi isaret eden yapiyi bul, icinde ad ara. */
-            if (ENVC("OWNERSCAN") && sr==0 && n==5 && pd){
+            static int s_ownerscan = -1; if (s_ownerscan < 0) s_ownerscan = getenv("OWNERSCAN") != NULL; if (s_ownerscan && sr==0 && n==5 && pd){
                 static int os_=0, oseen=0;
                 oseen++;
                 if (oseen > 400 && !os_){ os_=1;
@@ -2435,7 +2502,7 @@ int com_call(CPU *c, uint32_t magic){
             /* PARAMNAME: yigindaki isaretcileri tarayip D3DX efekt
              * parametresinin ADINI bul.  Hangi parametrenin hic
              * ayarlanmadigini ogrenmek icin. */
-            if (ENVC("PARAMNAME") && sr==0 && n==5 && pd){
+            static int s_paramname = -1; if (s_paramname < 0) s_paramname = getenv("PARAMNAME") != NULL; if (s_paramname && sr==0 && n==5 && pd){
                 static int pn=0, pseen=0;
                 pseen++;
                 if (pseen > 400 && pn < 1){ pn=1;
@@ -2462,19 +2529,19 @@ int com_call(CPU *c, uint32_t magic){
                 }
             }
             /* VSKBT: matrisi yukleyen guest cagirici zinciri */
-            if (ENVC("VSKBT") && sr==0 && n==5 && pd){
+            static int s_vskbt_on = -1; static int s_vskbt_val = 0; if (s_vskbt_on < 0){ const char *e = getenv("VSKBT"); s_vskbt_on = e != NULL; s_vskbt_val = e ? atoi(e) : 0; } if (s_vskbt_on && sr==0 && n==5 && pd){
                 static int bt=0, bseen=0;
                 bseen++;
-                if (bseen > atoi(ENVC("VSKBT")) && bt<2){ bt++;
+                if (bseen > s_vskbt_val && bt<2){ bt++;
                     fprintf(stderr,"  [vsk-cagirici] yukleme #%d pd=%08x\n", bseen, pd);
                     guest_backtrace(c, 14); }
             }
-            if (ENVC("WATCHVSK") && sr==0 && n==5 && pd){
+            static int s_watchvsk_on = -1; static int s_watchvsk_val = 0; if (s_watchvsk_on < 0){ const char *e = getenv("WATCHVSK"); s_watchvsk_on = e != NULL; s_watchvsk_val = e ? atoi(e) : 0; } if (s_watchvsk_on && sr==0 && n==5 && pd){
                 static int wv=0, wseen=0;
                 wseen++;
-                if (wseen > atoi(ENVC("WATCHVSK")) && !wv){ wv=1; mprot_arm(pd); }
+                if (wseen > s_watchvsk_val && !wv){ wv=1; mprot_arm(pd); }
             }
-            if (ENVC("VSKDUMP") && sr==0 && n==5 && pd){
+            static int s_vskdump = -1; if (s_vskdump < 0) s_vskdump = getenv("VSKDUMP") != NULL; if (s_vskdump && sr==0 && n==5 && pd){
                 static int vd=0, vseen=0;
                 vseen++;
                 if (vseen>500 && vd<3){ vd++;
@@ -2487,7 +2554,7 @@ int com_call(CPU *c, uint32_t magic){
                     }
                 }
             }
-            if (ENVC("CONSTDUMP") && sr==0 && n==5 && pd && mem_is_committed(pd+79)){
+            static int s_constdump = -1; if (s_constdump < 0) s_constdump = getenv("CONSTDUMP") != NULL; if (s_constdump && sr==0 && n==5 && pd && mem_is_committed(pd+79)){
                 static int cd=0;
                 if (cd<2){ cd++;
                     for (uint32_t bp2=(pd & ~15u); bp2>=0x10000000u; bp2-=16u){
@@ -2518,7 +2585,7 @@ int com_call(CPU *c, uint32_t magic){
                 }
                 if (nz==0) sifir++;
                 else if (buyuk){ kotu++;
-                    if (ENVC("WATCHALLOC") && !g_wc_armed){
+                    static int s_watchalloc = -1; if (s_watchalloc < 0) s_watchalloc = getenv("WATCHALLOC") != NULL; if (s_watchalloc && !g_wc_armed){
                         g_wc_armed = 1;
                         void watch_dump(const char*, int);
                         void watch_arm(uint32_t);
@@ -2731,7 +2798,7 @@ int com_call(CPU *c, uint32_t magic){
              * artmiyor -> animasyonlar ve zamanli ekran gecisleri donuyor.
              * Sanal saatimiz kare basina tam 1/60 s ilerlettigi icin kare
              * basina +1 tik dogru hizi verir. */
-            if (ENVC("FETICK") && mem_is_committed(0x008651a8u))
+            static int s_fetick = -1; if (s_fetick < 0) s_fetick = getenv("FETICK") != NULL; if (s_fetick && mem_is_committed(0x008651a8u))
                 MR32(0x008651a8u) = MR32(0x008651a8u) + 1u;
             /* FIXFRAMETIME: oyunun HEDEF KARE SURESI [0x865558] hic
              * kurulmuyor (kuran sub_00576cc0/ce0 cagrilmiyor) -> kare
@@ -2810,7 +2877,7 @@ int com_call(CPU *c, uint32_t magic){
               } }
             /* BOOTFLOW: onyukleme akisi listesini (0x836488) yuru.
              * Splash'te neyin beklendigini dogrudan gosterir. */
-            if (ENVC("BOOTFLOW") && (g_present_no % 900u) == 5u){
+            static int s_bootflow = -1; if (s_bootflow < 0) s_bootflow = getenv("BOOTFLOW") != NULL; if (s_bootflow && (g_present_no % 900u) == 5u){
                 uint32_t head = mem_is_committed(0x00836488u) ? MR32(0x00836488u) : 0;
                 { /* On yuz saati zinciri:
                    *   [0x865194] = kare farki (dt, saniye)
@@ -2905,7 +2972,7 @@ int com_call(CPU *c, uint32_t magic){
             }
             /* FLOWLOG: oyunun kendi akis izleyicisini oku.
              * 0x86549c ve 0x864f88 o an calisan adimin ADINI tutuyor. */
-            if (ENVC("FLOWLOG") && (g_present_no % 500u) == 1u){
+            static int s_flowlog = -1; if (s_flowlog < 0) s_flowlog = getenv("FLOWLOG") != NULL; if (s_flowlog && (g_present_no % 500u) == 1u){
                 static char last[160] = {0};
                 char cur[160]; cur[0] = 0;
                 uint32_t gl[2] = { 0x0086549cu, 0x00864f88u };
@@ -2960,7 +3027,7 @@ int com_call(CPU *c, uint32_t magic){
             { void mprot_rearm(void); mprot_rearm(); }
             /* Oyunun kendi slot havuzlari: tukenen varsa ekrana kirmizi ad
              * basiliyor.  Liste 0x828538 (kuyruk) -> +4 (onceki) ... 0x828534. */
-            if (ENVC("POOLS") && (g_present_no % 150) == 20){
+            static int s_pools = -1; if (s_pools < 0) s_pools = getenv("POOLS") != NULL; if (s_pools && (g_present_no % 150) == 20){
                 fprintf(stderr,"  --- slot havuzlari (liste basi 0x828530=%u) ---\n",
                         mem_is_committed(0x828530u) ? MR32(0x828530u) : 0xFFFFFFFFu);
                 /* dogrudan bilinen havuzlar: EventHandler (0x883e38), Event (0x883e34?) */
@@ -2996,7 +3063,7 @@ int com_call(CPU *c, uint32_t magic){
                 }
             }
             if (g_present_no == 100){
-                if (ENVC("HASHSCAN")){
+                static int s_hashscan = -1; if (s_hashscan < 0) s_hashscan = getenv("HASHSCAN") != NULL; if (s_hashscan){
                     static const uint32_t want[] = {0x3EE7363Fu, 0x04191C37u};
                     static const char *nmz[] = {"WORLDVIEWPROJECTION","TEXTUREOFFSET"};
                     for (int hz=0; hz<2; hz++){
@@ -3037,7 +3104,7 @@ int com_call(CPU *c, uint32_t magic){
             uint32_t ss=A(c,1), ds=A(c,3);
             uint32_t stex = (ss && mem_is_committed(ss+31)) ? MR32(ss+28) : 0u;
             uint32_t dtex = (ds && mem_is_committed(ds+31)) ? MR32(ds+28) : 0u;
-            if (ENVC("BLITLOG")){
+            static int s_blitlog = -1; if (s_blitlog < 0) s_blitlog = getenv("BLITLOG") != NULL; if (s_blitlog){
                 static int nb2=0;
                 if (nb2 < 8){ nb2++;
                     uint32_t so=(ss&&mem_is_committed(ss+43))?MR32(ss+40):0;
@@ -3052,7 +3119,7 @@ int com_call(CPU *c, uint32_t magic){
             }
             r=0; }
         else if (MID(SetRenderTarget)){
-            if (ENVC("CUBELOG")){
+            static int s_cubelog_rt = -1; if (s_cubelog_rt < 0) s_cubelog_rt = getenv("CUBELOG") != NULL; if (s_cubelog_rt){
                 static unsigned n3 = 0;
                 uint32_t sf2 = A(c,2);
                 if (n3 < 8 && sf2 && mem_is_committed(sf2+43) && MR32(sf2+40)==2u){
@@ -3067,7 +3134,7 @@ int com_call(CPU *c, uint32_t magic){
                 { static uint64_t org[8]; static int shown=0;
                   uint32_t o5 = (surf && mem_is_committed(surf+43)) ? MR32(surf+40) : 7;
                   if (o5 < 8) org[o5]++;
-                  if (ENVC("RTLOG") && !shown && (org[0]+org[1]+org[2]+org[3]+org[4]+org[7]) % 400 == 0){
+                  static int s_rtlog = -1; if (s_rtlog < 0) s_rtlog = getenv("RTLOG") != NULL; if (s_rtlog && !shown && (org[0]+org[1]+org[2]+org[3]+org[4]+org[7]) % 400 == 0){
                     fprintf(stderr,"  [RT] koken sayaci: yok=%llu backbuf=%llu yuzeyLvl=%llu"
                             " olusturulan=%llu getRT=%llu bilinmeyen=%llu\n",
                             (unsigned long long)org[0],(unsigned long long)org[1],
@@ -3091,7 +3158,7 @@ int com_call(CPU *c, uint32_t magic){
                     fprintf(stderr,"      %10.4f %10.4f %10.4f %10.4f\n",
                             MRF32(mp+rw*16), MRF32(mp+rw*16+4),
                             MRF32(mp+rw*16+8), MRF32(mp+rw*16+12)); } }
-            if (ENVC("XFORM") && nt<9 && mp && mem_is_committed(mp+63)){ nt++;
+            static int s_xform = -1; if (s_xform < 0) s_xform = getenv("XFORM") != NULL; if (s_xform && nt<9 && mp && mem_is_committed(mp+63)){ nt++;
                 const char *tn = ty==2?"VIEW":(ty==3?"PROJECTION":(ty==256?"WORLD":"?"));
                 fprintf(stderr,"  [SetTransform] tip=%u(%s)\n", ty, tn);
                 for (int rw=0; rw<4; rw++)
@@ -3103,7 +3170,7 @@ int com_call(CPU *c, uint32_t magic){
         else if (MID(SetViewport)){
             static int nv2=0;
             uint32_t vp2=A(c,1);
-            if (ENVC("XFORM") && nv2<6 && vp2 && mem_is_committed(vp2+23)){ nv2++;
+            static int s_xform_vp = -1; if (s_xform_vp < 0) s_xform_vp = getenv("XFORM") != NULL; if (s_xform_vp && nv2<6 && vp2 && mem_is_committed(vp2+23)){ nv2++;
                 fprintf(stderr,"  [SetViewport] x=%u y=%u g=%u y=%u minZ=%.3f maxZ=%.3f\n",
                         MR32(vp2), MR32(vp2+4), MR32(vp2+8), MR32(vp2+12),
                         MRF32(vp2+16), MRF32(vp2+20));
@@ -3254,11 +3321,11 @@ int com_call(CPU *c, uint32_t magic){
                 unsigned metal_create_texture_cube(unsigned,unsigned,unsigned,unsigned);
                 /* Kup doku HER ZAMAN render hedefi: oyun cevre haritasini
                  * alti yuze cizip sonra ornekliyor. */
-                MR32(t2+28)= getenv("NOCUBE")
+                static int s_nocube = -1; if (s_nocube < 0) s_nocube = getenv("NOCUBE") != NULL; MR32(t2+28)= s_nocube
                     ? metal_create_texture_ex(medge,medge,lev?lev:1u,fmt?fmt:22u,1u)
                     : metal_create_texture_cube(medge,lev?lev:1u,fmt?fmt:22u,1u);
             }
-            if (ENVC("CUBELOG")) fprintf(stderr,"  [kup] CreateCubeTexture kenar=%u seviye=%u kullanim=0x%x bicim=%u havuz=%u -> metal %u\n",
+            static int s_cubelog_create = -1; if (s_cubelog_create < 0) s_cubelog_create = getenv("CUBELOG") != NULL; if (s_cubelog_create) fprintf(stderr,"  [kup] CreateCubeTexture kenar=%u seviye=%u kullanim=0x%x bicim=%u havuz=%u -> metal %u\n",
                                           edge, lev, usage, fmt, A(c,5), MR32(t2+28));
             cube_mark(t2);                          /* KUP DOKU kaydi */
             if(pp) MR32(pp)=t2; r=0; }
@@ -3567,7 +3634,7 @@ int com_call(CPU *c, uint32_t magic){
                     metal_upload_texture(mid, level, g_mem+buf,
                                          metal_level_pitch(w,level,fmt), w, h, fmt);
             }
-            if (ENVC("LOCKLOG") && w==640 && h==480){
+            static int s_locklog = -1; if (s_locklog < 0) s_locklog = getenv("LOCKLOG") != NULL; if (s_locklog && w==640 && h==480){
                 static int nl=0;
                 if (nl<3){ nl++;
                     fprintf(stderr,"  [kilit] %ux%u fmt=%u lev=%u mid=%u adim=%u  ilk 32 bayt:\n    ",
@@ -3656,7 +3723,7 @@ int com_call(CPU *c, uint32_t magic){
                         bytes, desc?MR32(desc+4):0, desc?MR32(desc+12):0);
             /* DSLOG=1: hangi guest alt sistemi bu tamponu yaratti?  SFX
              * tamponlari (#1-#4) hic calinmadigi icin sahibini bulmak sart. */
-            if (ENVC("DSLOG")){
+            static int s_dslog_csb = -1; if (s_dslog_csb < 0) s_dslog_csb = getenv("DSLOG") != NULL; if (s_dslog_csb){
                 fprintf(stderr, "  [ses] --- CreateSoundBuffer #%d cagri zinciri ---\n",
                         (int)g_snd_play);
                 guest_backtrace(c, 10);
@@ -3792,7 +3859,7 @@ int com_call(CPU *c, uint32_t magic){
               if(fi>=0) cnt[fi]++;
               (void)reg_atexit;
               g_lock_obj = obj; g_lock_cnt = cnt; g_lock_n = nobj; }
-            if (ENVC("DSLOG")){ static int nl3=0;
+            static int s_dslog_lock = -1; if (s_dslog_lock < 0) s_dslog_lock = getenv("DSLOG") != NULL; if (s_dslog_lock){ static int nl3=0;
                 if (nl3 < 2){ nl3++;
                     fprintf(stderr,"  [ses] --- Lock cagri zinciri (tampon %u) ---\n",
                             self?MR32(self+28):0);
@@ -3825,7 +3892,7 @@ int com_call(CPU *c, uint32_t magic){
                         uint64_t host_us(void);
                         uint32_t elapsed = (uint32_t)(host_us()/1000ull) - t0;
                         uint32_t bps = MR32(self+20); if (!bps) bps = 176400u;
-                        position = (uint32_t)(((uint64_t)elapsed * bps / 1000ull) % sz);
+                        position = (uint32_t)(((uint64_t)elapsed * bps / 1000ull) % sz) & ~3u;
                     }
                     off = (position + 2048u) % sz;
                 }
@@ -3844,7 +3911,7 @@ int com_call(CPU *c, uint32_t magic){
             if (!ds_lock_add(self,buf+off,b1,b2?buf:0u,b2)){
                 r=0x8007000Eu; goto com_finish;
             }
-            if (ENVC("SNDLOG")){
+            static int s_sndlog = -1; if (s_sndlog < 0) s_sndlog = getenv("SNDLOG") != NULL; if (s_sndlog){
                 static int nl=0;
                 uint32_t sid2 = (self && mem_is_committed(self+31)) ? MR32(self+28) : 0;
                 if (nl<40 && sid2){ nl++;
@@ -3882,7 +3949,7 @@ int com_call(CPU *c, uint32_t magic){
              * [0x8b460c] (int16) olarak geziyor; +0x26 baytini "kullanimda"
              * olarak sinaviyor.  SFX olaylari kanal aciyor mu, dogrudan
              * olcmenin tek yolu bu. */
-            if (ENVC("VOICELOG")){
+            static int s_voicelog = -1; if (s_voicelog < 0) s_voicelog = getenv("VOICELOG") != NULL; if (s_voicelog){
                 static unsigned nu=0; static int peak=0;
                 if ((nu++ % 120u) == 0u){
                     uint32_t tb = mem_is_committed(0x8b466cu) ? MR32(0x8b466cu) : 0u;
@@ -3926,7 +3993,7 @@ int com_call(CPU *c, uint32_t magic){
                 /* SNDZERO: TAMAMEN SIFIR yazilan bolgeleri, cagiran guest
                  * adresiyle birlikte bildir.  Olculdu: oyun tam 30 sn'de bir
                  * ~50-95 ms sessizlik YAZIYOR (tampon ac degil, veri bos). */
-                if (ENVC("SNDZERO")){
+                static int s_sndzero = -1; if (s_sndzero < 0) s_sndzero = getenv("SNDZERO") != NULL; if (s_sndzero){
                     double audio_time(void);
                     double _t = audio_time();
                     /* Baslangictaki tampon temizlemeleri ilgi cekmiyor; asil
@@ -3956,7 +4023,7 @@ int com_call(CPU *c, uint32_t magic){
                       /* (this, Reserved, Priority, Flags); DSBPLAY_LOOPING=1 */
                       if (MR32(self+28)) audio_play((int)MR32(self+28), (A(c,3) & 1u) ? 1 : 0); }
             g_snd_play++;
-            if (ENVC("DSLOG")){
+            static int s_dslog_csb = -1; if (s_dslog_csb < 0) s_dslog_csb = getenv("DSLOG") != NULL; if (s_dslog_csb){
                 fprintf(stderr, "  [ses] --- Play cagri zinciri (tampon %u) ---\n",
                         self?MR32(self+28):0);
                 guest_backtrace(c, 10);
@@ -4039,7 +4106,7 @@ int com_call(CPU *c, uint32_t magic){
             if (!break_gcp && playing && t0){
                 uint64_t ms = (now/1000ull) - (uint64_t)t0;
                 uint64_t byt = ms * (uint64_t)bps / 1000ull;
-                pos = sz ? (uint32_t)(byt % (uint64_t)sz) : 0;
+                pos = sz ? ((uint32_t)(byt % (uint64_t)sz) & ~3u) : 0;
             } else if (self) pos = MR32(self+16);
             if (!break_gcp){
                 if(self) MR32(self+16)=pos;
@@ -4126,7 +4193,7 @@ int com_call(CPU *c, uint32_t magic){
          * kuruyor ama hic okumuyor; zincirin nerede kesildigini gorelim. */
         int di_tr = 0;
         { static int n2 = 0;
-          if (ENVC("DITRACE") && n2 < 140){ n2++; di_tr = 1;
+          static int s_ditrace = -1; if (s_ditrace < 0) s_ditrace = getenv("DITRACE") != NULL; if (s_ditrace && n2 < 140){ n2++; di_tr = 1;
               fprintf(stderr,"  [DI%u/%08x] %-24s", dkind, self, nm); } }
         if (MID(EnumObjects)){
             /* (lpCallback, pvRef, dwFlags) -- geri cagirma:
@@ -4176,7 +4243,30 @@ int com_call(CPU *c, uint32_t magic){
             }
             r=0; }
         else
-        if      (MID(SetDataFormat)){ if(self) MR32(self+4)=A(c,1); r=0; }
+        if      (MID(SetDataFormat)){
+            if(self) MR32(self+4)=A(c,1);
+            if (dkind == 1u){
+                memset(g_act_of_key,0,sizeof g_act_of_key);
+                memset(g_act_ofs,0,sizeof g_act_ofs);
+                memset(g_act_mapped,0,sizeof g_act_mapped);
+                memset(g_di_pending_seq,0,sizeof g_di_pending_seq);
+                memset(g_di_pending_time,0,sizeof g_di_pending_time);
+                memset(g_di_delivered,0,sizeof g_di_delivered);
+                memset(g_di_reset_pending,0,sizeof g_di_reset_pending);
+                g_act_count=0; g_act_map_set=0; g_act_data_size=0;
+                { unsigned char cur[256];
+                  metal_fill_keyboard(cur,256u);
+                  di_rebase_keyboard(cur); }
+#if COM_HAS_INPUT_EVENT_QUEUE
+                { uint32_t cursor=0;
+                  uint32_t pending=nfsu2_input_event_snapshot(&cursor);
+                  nfsu2_input_consume_events(cursor,pending);
+                  (void)nfsu2_input_take_event_overflow();
+                  g_di_event_generation=nfsu2_input_event_generation();
+                  g_di_reset_sequence_base=nfsu2_input_event_reset_sequence_base(); }
+#endif
+            }
+            r=0; }
         else if (MID(SetCooperativeLevel)) r=0;
         else if (MID(Acquire)||MID(Unacquire)||MID(Poll)) r=0;
         else if (MID(GetDeviceState)){
@@ -4189,20 +4279,32 @@ int com_call(CPU *c, uint32_t magic){
                         (self && mem_is_committed(self+11)) ? MR32(self+8) : 0); } }
             if(p && cb && cb<4096u){
                 mem_commit(p,cb); memset(g_mem+p,0,cb);
-                /* 256 baytlik istek = DirectInput klavye tablosu */
-                if (cb == 20u && metal_available()){        /* DIMOUSESTATE2 */
+                /* Action-map state is a DWORD array indexed by DIACTION offset. */
+                if (dkind == 1u && g_act_map_set && cb == g_act_data_size &&
+                    metal_available()){
+                    unsigned char cur[256];
+                    metal_fill_keyboard(cur,256u);
+                    for (uint32_t k=1;k<256u;k++){
+                        uint32_t ofs=g_act_ofs[k];
+                        if (g_act_mapped[k] && cur[k] && ofs+4u<=cb)
+                            MR32(p+ofs)=0x80u;
+                    }
+                }
+                /* Mouse-sized buffers belong only to the mouse device. */
+                else if (dkind == 2u && cb == 20u && metal_available()){
                     metal_fill_mouse(g_mem+p, cb);
                     g_dikey_calls++;
                     for (uint32_t q=12;q<20;q++)
                         if (MR8(p+q)){ g_dikey_hits++; break; }
                 }
-                else if (cb == 16u && metal_available()){   /* DIMOUSESTATE */
+                else if (dkind == 2u && cb == 16u && metal_available()){
                     unsigned char tmpm[20];
                     metal_fill_mouse(tmpm, 20);
                     memcpy(g_mem+p, tmpm, 16);
                     g_dikey_calls++;
                 }
-                else if (cb == 256u && metal_available()){
+                /* 256-byte unformatted keyboard state remains available. */
+                else if (dkind == 1u && cb == 256u && metal_available()){
                     metal_fill_keyboard(g_mem+p, 256u);
                     g_dikey_calls++;
                     for (uint32_t q=0;q<256;q++)
@@ -4219,15 +4321,41 @@ int com_call(CPU *c, uint32_t magic){
              * DIACTIONA (40): +0 uAppData +4 dwSemantic +32 dwObjID +36 dwHow */
             uint32_t af=A(c,1);
             int is_build = MID(BuildActionMap);
+            /* This compatibility table belongs only to the keyboard object.
+             * Mouse action maps must not erase it or consume keyboard edges. */
+            if (dkind != 1u){ r=0; }
+            else {
             if (!is_build){
                 memset(g_act_of_key, 0, sizeof g_act_of_key);
                 memset(g_act_ofs, 0, sizeof g_act_ofs);
+                memset(g_act_mapped, 0, sizeof g_act_mapped);
                 g_act_count = 0;
+                g_act_map_set = 0;
+                g_act_data_size = 0;
+                memset(g_di_pending_seq, 0, sizeof g_di_pending_seq);
+                memset(g_di_pending_time, 0, sizeof g_di_pending_time);
+                memset(g_di_delivered, 0, sizeof g_di_delivered);
+                memset(g_di_reset_pending, 0, sizeof g_di_reset_pending);
+                { unsigned char cur[256];
+                  metal_fill_keyboard(cur,256u);
+                  di_rebase_keyboard(cur); }
+#if COM_HAS_INPUT_EVENT_QUEUE
+                uint32_t cursor = 0;
+                uint32_t pending = nfsu2_input_event_snapshot(&cursor);
+                nfsu2_input_consume_events(cursor, pending);
+                (void)nfsu2_input_take_event_overflow();
+                g_di_event_generation = nfsu2_input_event_generation();
+                g_di_reset_sequence_base = nfsu2_input_event_reset_sequence_base();
+#endif
                 if (ENVC("DIMAP")) fprintf(stderr,"  [harita] --- yeni etkin harita ---\n");
             }
             if (af && mem_is_committed(af+71)){
                 uint32_t nact=MR32(af+12), rg=MR32(af+16), asz=MR32(af+4);
                 if (!asz) asz=40u;
+                if (!is_build){
+                    g_act_map_set = 1;
+                    g_act_data_size = MR32(af+8);
+                }
                 { static int sl=0; if (sl<4){ sl++;
                     fprintf(stderr,"  [DI] %s: %u eylem, veriBoyutu=%u eylemBoyutu=%u tampon=%u cihaz=%u\n",
                             nm, nact, MR32(af+8), asz, MR32(af+40),
@@ -4251,15 +4379,24 @@ int com_call(CPU *c, uint32_t magic){
                         } else {
                             g_act_of_key[dik] = app;
                             g_act_ofs[dik]    = k * 4u;      /* veri ofseti */
+                            g_act_mapped[dik] = 1;
                             g_act_count++;
                             if (ENVC("DIMAP"))
                                 fprintf(stderr,"  [harita] dik=0x%02x -> eylem 0x%x (ofs %u)\n",
                                         dik, app, k*4u);
                         }
                     }
+                    if (!is_build && g_act_mapped[0x01u] && g_act_of_key[0x01u] == 0x22u &&
+                        !g_act_mapped[0x0Eu]){
+                        g_act_of_key[0x0Eu] = g_act_of_key[0x01u];
+                        g_act_ofs[0x0Eu]    = g_act_ofs[0x01u];
+                        g_act_mapped[0x0Eu] = 1;
+                        g_act_count++;
+                    }
                 }
             }
-            r=0; }
+            r=0;
+            } }
         else if (MID(GetDeviceData)){
             /* (cbObjectData, rgdod, pdwInOut, dwFlags)
              * DIDEVICEOBJECTDATA: +0 dwOfs +4 dwData +8 dwTimeStamp
@@ -4267,35 +4404,130 @@ int com_call(CPU *c, uint32_t magic){
             uint32_t cb=A(c,1), rg=A(c,2), pcnt=A(c,3), flags=A(c,4);
             uint32_t want = (pcnt && mem_is_committed(pcnt+3)) ? MR32(pcnt) : 0;
             uint32_t n = 0;
+            int peek = (flags & 1u) != 0;
+            int consume = (rg != 0 || want == 0xFFFFFFFFu) && !peek;
+            r = 0;
             { static int sg=0;
-              if (ENVC("DIDATA") && sg<4){ sg++;
+              static int s_didata = -1; if (s_didata < 0) s_didata = getenv("DIDATA") != NULL; if (s_didata && sg<4){ sg++;
                 fprintf(stderr,"  [DIdata] cb=%u istenen=%u bayrak=0x%x eylem=%d\n",
                         cb, want, flags, g_act_count); } }
-            if (g_act_count && metal_available() && cb >= 16u && cb <= 32u){
-                unsigned char cur[256];
-                metal_fill_keyboard(cur, 256);
-                for (uint32_t k = 1; k < 256u && n < want; k++){
-                    if (!g_act_of_key[k]) continue;
-                    unsigned char now = cur[k] ? 1 : 0, was = g_kb_prev[k];
-                    if (now == was) continue;
-                    if (rg && !(flags & 1u)){          /* DIGDD_PEEK degilse tuket */
-                        uint32_t e = rg + n*cb;
-                        mem_commit(e, cb); memset(g_mem+e, 0, cb);
-                        MR32(e)    = g_act_ofs[k];
-                        MR32(e+4)  = now ? 0x80u : 0u;
-                        MR32(e+8)  = (uint32_t)(host_us_ms());
-                        MR32(e+12) = g_di_seq++;
-                        if (cb >= 20u) MR32(e+16) = g_act_of_key[k];
-                        { static int se=0;
-                          if (ENVC("DIDATA") && se<6){ se++;
-                            fprintf(stderr,"  [DIdata] olay: dik=%u ofs=%u veri=0x%x app=0x%x\n",
-                                    k, g_act_ofs[k], now?0x80u:0u, g_act_of_key[k]); } }
+            if (dkind == 1u && metal_available() && cb >= 16u && cb <= 32u){
+#if COM_HAS_INPUT_EVENT_QUEUE
+                uint32_t generation=nfsu2_input_event_generation();
+                if (!g_di_event_generation){
+                    g_di_event_generation=generation;
+                    g_di_reset_sequence_base=nfsu2_input_event_reset_sequence_base();
+                } else if (generation != g_di_event_generation){
+                    g_di_event_generation=generation;
+                    g_di_reset_sequence_base=nfsu2_input_event_reset_sequence_base();
+                    for (uint32_t k=1;k<256u;k++){
+                        if (g_di_delivered[k]) g_di_reset_pending[k]=1;
+                        if (g_di_reset_pending[k]){
+                            g_di_pending_seq[k]=0;
+                            g_di_pending_time[k]=0;
+                        }
                     }
-                    if (!(flags & 1u)) g_kb_prev[k] = now;
-                    n++; g_di_events++;
+                }
+#endif
+                if (!want){
+#if COM_HAS_INPUT_EVENT_QUEUE
+                    /* A zero-element call checks whether the ring overflowed. */
+                    if (peek ? nfsu2_input_event_overflowed() : nfsu2_input_take_event_overflow()) r=1u;
+#endif
+                } else {
+#if COM_HAS_INPUT_EVENT_QUEUE
+                    uint32_t cursor = 0;
+                    uint32_t available = nfsu2_input_event_snapshot(&cursor);
+                    if (consume ? nfsu2_input_take_event_overflow() : nfsu2_input_event_overflowed()){
+                        if (consume){
+                            nfsu2_input_consume_events(cursor, available);
+                            unsigned char cur[256];
+                            metal_fill_keyboard(cur,256u);
+                            di_rebase_keyboard(cur);
+                            g_di_reset_sequence_base=nfsu2_input_event_reset_sequence_base();
+                            di_mark_cleared_releases(cur);
+                        }
+                        r=1u; /* DI_BUFFEROVERFLOW; state is rebased for the next call. */
+                    } else {
+                        /* A clear/overflow release precedes all newly queued input. */
+                        for (uint32_t k=1;k<256u && n<want;k++){
+                            if (!g_di_reset_pending[k]) continue;
+                            if (g_act_map_set && !g_act_mapped[k]){
+                                if (consume){
+                                    g_di_delivered[k]=0;
+                                    g_di_reset_pending[k]=0;
+                                    g_di_pending_seq[k]=0;
+                                    g_di_pending_time[k]=0;
+                                }
+                                continue;
+                            }
+                            if (!g_di_pending_seq[k]){
+                                g_di_pending_time[k]=host_us_ms();
+                                g_di_pending_seq[k]=g_di_reset_sequence_base+k;
+                            }
+                            di_write_data(rg,n,cb,(uint8_t)k,0,
+                                          g_di_pending_time[k],g_di_pending_seq[k]);
+                            n++; g_di_events++;
+                            if (consume){
+                                g_di_delivered[k]=0;
+                                g_di_reset_pending[k]=0;
+                                g_di_pending_seq[k]=0;
+                                g_di_pending_time[k]=0;
+                            }
+                        }
+                        uint32_t scanned = 0;
+                        for (uint32_t i=0; i<available && n<want; i++){
+                            uint8_t key=0; bool pressed=false;
+                            uint32_t time=0, seq=0;
+                            if (!nfsu2_input_event_at(cursor,i,&key,&pressed,&time,&seq)) break;
+                            scanned=i+1u;
+                            if (g_act_map_set && !g_act_mapped[key]) continue;
+
+                            di_write_data(rg,n,cb,key,pressed,time,seq);
+                            { static int se=0;
+                              static int s_didata2 = -1; if (s_didata2 < 0) s_didata2 = getenv("DIDATA") != NULL; if (s_didata2 && se<6){ se++;
+                                fprintf(stderr,"  [DIdata] olay: dik=%u ofs=%u veri=0x%x app=0x%x\n",
+                                        key, g_act_map_set?g_act_ofs[key]:key,
+                                        pressed?0x80u:0u,
+                                        g_act_map_set?g_act_of_key[key]:0u); } }
+                            n++; g_di_events++;
+                            if (consume){
+                                g_di_delivered[key]=pressed?1u:0u;
+                                g_di_reset_pending[key]=0;
+                                g_di_pending_seq[key]=0;
+                                g_di_pending_time[key]=0;
+                            }
+                        }
+                        if (consume) nfsu2_input_consume_events(cursor, scanned);
+                    }
+#else
+                    unsigned char cur[256];
+                    metal_fill_keyboard(cur, 256u);
+                    for (uint32_t k=1;k<256u && n<want;k++){
+                        unsigned char now=cur[k]?1u:0u;
+                        if (now==g_kb_prev[k]) continue;
+                        if (g_act_map_set && !g_act_mapped[k]){
+                            if (consume){ g_kb_prev[k]=now; g_di_pending_seq[k]=0; }
+                            continue;
+                        }
+                        if (!g_di_pending_seq[k]){
+                            g_di_pending_time[k]=host_us_ms();
+                            g_di_pending_seq[k]=g_di_seq++;
+                        }
+                        di_write_data(rg,n,cb,(uint8_t)k,now!=0,
+                                      g_di_pending_time[k],g_di_pending_seq[k]);
+                        n++; g_di_events++;
+                        if (consume){
+                            g_kb_prev[k]=now;
+                            g_di_delivered[k]=now;
+                            g_di_pending_seq[k]=0;
+                            g_di_pending_time[k]=0;
+                        }
+                    }
+#endif
                 }
             }
-            if(pcnt) MR32(pcnt)=n; r=0; }
+            if(pcnt) MR32(pcnt)=n; }
         else if (MID(GetCapabilities)){
             uint32_t p=A(c,1);
             if(p){ uint32_t sz=MR32(p); if(!sz||sz>256u) sz=44u; mem_commit(p,sz);
