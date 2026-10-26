@@ -12,6 +12,7 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 #if defined(NFS_FULL_RUNTIME) && NFS_FULL_RUNTIME
 /* Match DirectInput's GetTickCount-style clock source in runtime/com.c. */
@@ -50,16 +51,18 @@ static _Atomic bool g_input_event_overflow;
 
 /*
  * Titreşim (Rumble) Durum Değişkenleri
- * Lock-free atomic fixed-point (0..10000 = 0.0f..1.0f) ve monotonik sayaçlar.
+ * Each message is one atomic word: a consumer cannot steal the next impact's
+ * intensity while reading the previous impact's ID, sharpness or duration.
+ * Continuous: 14-bit intensity, 14-bit sharpness, 4-bit poll TTL.
+ * Impact: 14-bit intensity, 14-bit sharpness, 9-bit duration, 27-bit sequence.
  */
-static _Atomic uint32_t g_rumble_continuous_intensity;
-static _Atomic uint32_t g_rumble_continuous_sharpness;
-static _Atomic uint32_t g_rumble_continuous_ttl;
-static _Atomic uint32_t g_rumble_impact_intensity;
-static _Atomic uint32_t g_rumble_impact_sharpness;
-static _Atomic uint32_t g_rumble_impact_duration_ms;
+static _Atomic uint32_t g_rumble_continuous;
+static _Atomic uint64_t g_rumble_impact;
 static _Atomic uint32_t g_rumble_impact_id;
-static _Atomic uint32_t g_rumble_pending_impact;
+static uint32_t g_rumble_delivered_id; /* single Swift/main-thread consumer */
+static _Atomic uint32_t g_rumble_hook_calls, g_rumble_local_samples;
+static _Atomic uint32_t g_rumble_gated_samples, g_rumble_last_gate;
+static _Atomic uint32_t g_rumble_continuous_reports, g_rumble_impact_reports;
 
 static bool input_enabled(void) {
     return atomic_load_explicit(&g_input_enabled, memory_order_acquire);
@@ -388,119 +391,100 @@ void nfsu2_input_set_viewport(uint32_t viewport_w, uint32_t viewport_h,
  * Titreşim (Rumble / Haptics) API Fonksiyonları
  */
 
-void nfsu2_input_clear_rumble(void) {
-    atomic_store_explicit(&g_rumble_continuous_intensity, 0, memory_order_release);
-    atomic_store_explicit(&g_rumble_continuous_sharpness, 0, memory_order_release);
-    atomic_store_explicit(&g_rumble_continuous_ttl, 0, memory_order_release);
-    atomic_store_explicit(&g_rumble_impact_intensity, 0, memory_order_release);
-    atomic_store_explicit(&g_rumble_impact_sharpness, 0, memory_order_release);
-    atomic_store_explicit(&g_rumble_impact_duration_ms, 0, memory_order_release);
-    atomic_store_explicit(&g_rumble_pending_impact, 0, memory_order_release);
+static uint32_t rumble_fixed(float value) {
+    if (!isfinite(value) || value <= 0.0f) return 0;
+    if (value >= 1.0f) return 10000u;
+    return (uint32_t)(value * 10000.0f + 0.5f);
 }
 
-void nfsu2_input_report_rumble(float continuous_intensity, float continuous_sharpness) {
-    if (!input_enabled()) {
-        atomic_store_explicit(&g_rumble_continuous_intensity, 0, memory_order_release);
-        atomic_store_explicit(&g_rumble_continuous_sharpness, 0, memory_order_release);
-        atomic_store_explicit(&g_rumble_continuous_ttl, 0, memory_order_release);
-        return;
-    }
+void nfsu2_input_note_rumble_hook(uint32_t gate) {
+    atomic_fetch_add_explicit(&g_rumble_hook_calls, 1u, memory_order_relaxed);
+    if (gate == 3u || gate == 4u)
+        atomic_fetch_add_explicit(&g_rumble_local_samples, 1u, memory_order_relaxed);
+    if (gate == 3u)
+        atomic_fetch_add_explicit(&g_rumble_gated_samples, 1u, memory_order_relaxed);
+    /* Other cars must not overwrite the local player's diagnostic gate. */
+    if (gate != 2u)
+        atomic_store_explicit(&g_rumble_last_gate, gate, memory_order_relaxed);
+}
 
-    if (continuous_intensity < 0.0f) continuous_intensity = 0.0f;
-    if (continuous_intensity > 1.0f) continuous_intensity = 1.0f;
-    if (continuous_sharpness < 0.0f) continuous_sharpness = 0.0f;
-    if (continuous_sharpness > 1.0f) continuous_sharpness = 1.0f;
+void nfsu2_input_get_rumble_diagnostics(NFSU2RumbleDiagnostics *d) {
+    if (!d) return;
+    d->hook_calls = atomic_load_explicit(&g_rumble_hook_calls, memory_order_relaxed);
+    d->local_samples = atomic_load_explicit(&g_rumble_local_samples, memory_order_relaxed);
+    d->gated_samples = atomic_load_explicit(&g_rumble_gated_samples, memory_order_relaxed);
+    d->continuous_reports = atomic_load_explicit(&g_rumble_continuous_reports, memory_order_relaxed);
+    d->impact_reports = atomic_load_explicit(&g_rumble_impact_reports, memory_order_relaxed);
+    d->last_gate = atomic_load_explicit(&g_rumble_last_gate, memory_order_relaxed);
+}
 
-    uint32_t int_fixed = (uint32_t)(continuous_intensity * 10000.0f + 0.5f);
-    uint32_t shp_fixed = (uint32_t)(continuous_sharpness * 10000.0f + 0.5f);
+void nfsu2_input_clear_rumble(void) {
+    atomic_store_explicit(&g_rumble_continuous, 0, memory_order_release);
+    atomic_store_explicit(&g_rumble_impact, 0, memory_order_release);
+}
 
-    atomic_store_explicit(&g_rumble_continuous_intensity, int_fixed, memory_order_release);
-    atomic_store_explicit(&g_rumble_continuous_sharpness, shp_fixed, memory_order_release);
-
-    if (continuous_intensity > 0.001f) {
-        atomic_store_explicit(&g_rumble_continuous_ttl, 8u, memory_order_release);
-    } else {
-        atomic_store_explicit(&g_rumble_continuous_ttl, 0u, memory_order_release);
-    }
+void nfsu2_input_report_rumble(float intensity, float sharpness) {
+    uint32_t i = rumble_fixed(intensity), s = rumble_fixed(sharpness);
+    uint32_t message = input_enabled() && i > 10u
+        ? i | (s << 14) | (8u << 28) : 0u;
+    atomic_store_explicit(&g_rumble_continuous, message, memory_order_release);
+    if (message)
+        atomic_fetch_add_explicit(&g_rumble_continuous_reports, 1u, memory_order_relaxed);
+    if (!input_enabled())
+        atomic_store_explicit(&g_rumble_continuous, 0, memory_order_release);
 }
 
 void nfsu2_input_trigger_impact(float intensity, float sharpness, uint32_t duration_ms) {
     if (!input_enabled()) return;
-
-    if (intensity < 0.0f) intensity = 0.0f;
-    if (intensity > 1.0f) intensity = 1.0f;
-    if (intensity <= 0.01f) return;
-
-    if (sharpness < 0.0f) sharpness = 0.0f;
-    if (sharpness > 1.0f) sharpness = 1.0f;
-
+    uint32_t i = rumble_fixed(intensity), s = rumble_fixed(sharpness);
+    if (i <= 100u) return;
     if (duration_ms < 60u) duration_ms = 60u;
-    else if (duration_ms > 280u) duration_ms = 280u;
-
-    uint32_t new_int = (uint32_t)(intensity * 10000.0f + 0.5f);
-    uint32_t new_shp = (uint32_t)(sharpness * 10000.0f + 0.5f);
-
-    uint32_t pending = atomic_load_explicit(&g_rumble_pending_impact, memory_order_acquire);
-    if (pending != 0) {
-        uint32_t cur_int = atomic_load_explicit(&g_rumble_impact_intensity, memory_order_acquire);
-        if (new_int <= cur_int) {
-            /* Bekleyen mevcut darbe bu darbeden daha güçlü veya eşit */
-            return;
-        }
-    }
-
-    atomic_store_explicit(&g_rumble_impact_sharpness, new_shp, memory_order_release);
-    atomic_store_explicit(&g_rumble_impact_duration_ms, duration_ms, memory_order_release);
-    atomic_store_explicit(&g_rumble_impact_intensity, new_int, memory_order_release);
-    atomic_fetch_add_explicit(&g_rumble_impact_id, 1u, memory_order_acq_rel);
-    atomic_store_explicit(&g_rumble_pending_impact, 1u, memory_order_release);
+    if (duration_ms > 280u) duration_ms = 280u;
+    uint32_t id = (atomic_fetch_add_explicit(&g_rumble_impact_id, 1u,
+                                            memory_order_relaxed) + 1u) & 0x7ffffffu;
+    uint64_t message = (uint64_t)i | ((uint64_t)s << 14) |
+        ((uint64_t)duration_ms << 28) | ((uint64_t)id << 37);
+    uint64_t previous = atomic_load_explicit(&g_rumble_impact, memory_order_acquire);
+    do {
+        if ((previous & 0x3fffu) >= i) return;
+    } while (!atomic_compare_exchange_weak_explicit(&g_rumble_impact, &previous,
+                   message, memory_order_acq_rel, memory_order_acquire));
+    atomic_fetch_add_explicit(&g_rumble_impact_reports, 1u, memory_order_relaxed);
+    if (!input_enabled())
+        atomic_store_explicit(&g_rumble_impact, 0, memory_order_release);
 }
 
 bool nfsu2_input_poll_rumble(NFSU2RumbleSnapshot *snapshot) {
     if (!snapshot) return false;
-
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->impact_id = g_rumble_delivered_id;
     if (!input_enabled()) {
         nfsu2_input_clear_rumble();
-        snapshot->continuous_intensity = 0.0f;
-        snapshot->continuous_sharpness = 0.0f;
-        snapshot->impact_intensity = 0.0f;
-        snapshot->impact_sharpness = 0.0f;
-        snapshot->impact_duration_ms = 0;
-        snapshot->impact_id = atomic_load_explicit(&g_rumble_impact_id, memory_order_acquire);
         return false;
     }
-
-    uint32_t ttl = atomic_load_explicit(&g_rumble_continuous_ttl, memory_order_acquire);
-    if (ttl > 0) {
-        atomic_fetch_sub_explicit(&g_rumble_continuous_ttl, 1u, memory_order_acq_rel);
-        uint32_t c_int = atomic_load_explicit(&g_rumble_continuous_intensity, memory_order_acquire);
-        uint32_t c_shp = atomic_load_explicit(&g_rumble_continuous_sharpness, memory_order_acquire);
-        snapshot->continuous_intensity = (float)c_int / 10000.0f;
-        snapshot->continuous_sharpness = (float)c_shp / 10000.0f;
-    } else {
-        atomic_store_explicit(&g_rumble_continuous_intensity, 0, memory_order_release);
-        atomic_store_explicit(&g_rumble_continuous_sharpness, 0, memory_order_release);
-        snapshot->continuous_intensity = 0.0f;
-        snapshot->continuous_sharpness = 0.0f;
+    uint32_t continuous = atomic_load_explicit(&g_rumble_continuous, memory_order_acquire);
+    while (continuous >> 28) {
+        uint32_t next = continuous - (1u << 28);
+        if (atomic_compare_exchange_weak_explicit(&g_rumble_continuous, &continuous,
+                next, memory_order_acq_rel, memory_order_acquire)) {
+            snapshot->continuous_intensity = (float)(continuous & 0x3fffu) / 10000.0f;
+            snapshot->continuous_sharpness = (float)((continuous >> 14) & 0x3fffu) / 10000.0f;
+            break;
+        }
     }
-
-    uint32_t pending = atomic_exchange_explicit(&g_rumble_pending_impact, 0, memory_order_acq_rel);
-    snapshot->impact_id = atomic_load_explicit(&g_rumble_impact_id, memory_order_acquire);
-
-    if (pending != 0) {
-        uint32_t imp_int = atomic_exchange_explicit(&g_rumble_impact_intensity, 0, memory_order_acq_rel);
-        uint32_t imp_shp = atomic_load_explicit(&g_rumble_impact_sharpness, memory_order_acquire);
-        uint32_t imp_dur = atomic_load_explicit(&g_rumble_impact_duration_ms, memory_order_acquire);
-        snapshot->impact_intensity = (float)imp_int / 10000.0f;
-        snapshot->impact_sharpness = (float)imp_shp / 10000.0f;
-        snapshot->impact_duration_ms = imp_dur;
-    } else {
-        snapshot->impact_intensity = 0.0f;
-        snapshot->impact_sharpness = 0.0f;
-        snapshot->impact_duration_ms = 0;
+    uint64_t impact = atomic_exchange_explicit(&g_rumble_impact, 0, memory_order_acq_rel);
+    if (impact) {
+        snapshot->impact_intensity = (float)(impact & 0x3fffu) / 10000.0f;
+        snapshot->impact_sharpness = (float)((impact >> 14) & 0x3fffu) / 10000.0f;
+        snapshot->impact_duration_ms = (uint32_t)((impact >> 28) & 0x1ffu);
+        snapshot->impact_id = g_rumble_delivered_id = (uint32_t)(impact >> 37);
     }
-
-    return (snapshot->continuous_intensity > 0.001f || snapshot->impact_intensity > 0.001f);
+    if (!input_enabled()) {
+        memset(snapshot, 0, sizeof(*snapshot));
+        snapshot->impact_id = g_rumble_delivered_id;
+        return false;
+    }
+    return snapshot->continuous_intensity > 0.001f || snapshot->impact_intensity > 0.001f;
 }
 
 void nfsu2_input_reset(void) {

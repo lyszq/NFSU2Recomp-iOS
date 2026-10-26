@@ -130,13 +130,21 @@ typedef struct {
     float impact_intensity;     /* 0.0f .. 1.0f */
     float impact_sharpness;     /* 0.0f .. 1.0f */
     uint32_t impact_duration_ms;/* 60 .. 280 ms */
-    uint32_t impact_id;         /* monotonic counter incremented on each impact */
+    uint32_t impact_id;         /* sequence modulo 2^27; belongs to this snapshot */
 } NFSU2RumbleSnapshot;
 
 void nfsu2_input_report_rumble(float continuous_intensity, float continuous_sharpness);
 void nfsu2_input_trigger_impact(float intensity, float sharpness, uint32_t duration_ms);
 void nfsu2_input_clear_rumble(void);
 bool nfsu2_input_poll_rumble(NFSU2RumbleSnapshot *snapshot);
+/* Diagnostic counters are process-lifetime, independent of input clearing. */
+typedef struct {
+    uint32_t hook_calls, local_samples, gated_samples;
+    uint32_t continuous_reports, impact_reports, last_gate;
+} NFSU2RumbleDiagnostics;
+/* 1: invalid vehicle, 2: AI, 3: local but inactive, 4: local active. */
+void nfsu2_input_note_rumble_hook(uint32_t gate);
+void nfsu2_input_get_rumble_diagnostics(NFSU2RumbleDiagnostics *diagnostics);
 void nfsu2_input_reset(void);
 
 /*

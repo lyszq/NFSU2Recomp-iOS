@@ -269,7 +269,7 @@ def configure_project(mode: str = "auto", out: str | Path | None = None,
         extra_hsp.append("$(SRCROOT)/../gen/all")
     base["HEADER_SEARCH_PATHS"] = list(dict.fromkeys(list(current_hsp) + extra_hsp))
 
-    version, build = ("0.27.1", "36") if mode == "all" else ("0.19.0", "26")
+    version, build = ("0.27.2", "37") if mode == "all" else ("0.19.0", "26")
     target["info"]["properties"]["UIFileSharingEnabled"] = True
     target["info"]["properties"]["LSSupportsOpeningDocumentsInPlace"] = True
     spec["targets"]["NFSU2iOS"]["info"]["properties"]["CFBundleShortVersionString"] = version

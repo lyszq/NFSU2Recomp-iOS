@@ -656,6 +656,7 @@ public final class NFSU2MetalRenderUIView: UIView {
 
     @objc private func applicationWillResignActive(_ notification: Notification) {
         stopDisplayLink()
+        GameControllerManager.shared.suspendRumble()
         primaryPointerTouch = nil
         pointerTouchToken &+= 1
         nfsu2_input_clear_all()
@@ -667,6 +668,7 @@ public final class NFSU2MetalRenderUIView: UIView {
     
     @objc private func applicationDidEnterBackground(_ notification: Notification) {
         stopDisplayLink()
+        GameControllerManager.shared.suspendRumble()
         primaryPointerTouch = nil
         pointerTouchToken &+= 1
         nfsu2_input_clear_all()
@@ -717,12 +719,13 @@ public final class NFSU2MetalRenderUIView: UIView {
     }
     
     @objc private func renderTick() {
-        _ = metal_render_frame()
         GameControllerManager.shared.pollRumbleTick()
+        _ = metal_render_frame()
     }
     
     deinit {
         stopDisplayLink()
+        GameControllerManager.shared.suspendRumble()
 #if NFS_FULL_RUNTIME
         sessionStatusTimer?.invalidate()
         // The guest/runtime is process-lifetime state. View teardown only

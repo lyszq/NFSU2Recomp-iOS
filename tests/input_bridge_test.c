@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include "../ios/NFSU2iOS/Native/NFSU2InputBridge.h"
 #include "guest_cursor.h"
 #include "guest_memory.h"
@@ -412,6 +414,51 @@ static void test_rumble_clear_and_disabled(void) {
     printf("PASS: test_rumble_clear_and_disabled\n");
 }
 
+static _Atomic bool rumble_writer_done;
+static void *rumble_writer(void *unused) {
+    (void)unused;
+    for (unsigned i = 0; i < 100000; ++i) {
+        bool high = (i & 1u) != 0;
+        nfsu2_input_trigger_impact(high ? 0.8f : 0.3f,
+                                  high ? 0.9f : 0.2f, high ? 200u : 100u);
+        nfsu2_input_report_rumble(high ? 0.8f : 0.3f, high ? 0.8f : 0.3f);
+    }
+    atomic_store_explicit(&rumble_writer_done, true, memory_order_release);
+    return NULL;
+}
+
+static void test_rumble_concurrent_coherent_messages(void) {
+    nfsu2_input_clear_rumble();
+    atomic_store(&rumble_writer_done, false);
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, rumble_writer, NULL) == 0);
+    uint32_t last_id = 0;
+    unsigned impacts = 0;
+    do {
+        NFSU2RumbleSnapshot s;
+        nfsu2_input_poll_rumble(&s);
+        if (s.impact_intensity > 0) {
+            bool high = s.impact_intensity > 0.5f;
+            assert(fabsf(s.impact_intensity - (high ? 0.8f : 0.3f)) < 0.001f);
+            assert(fabsf(s.impact_sharpness - (high ? 0.9f : 0.2f)) < 0.001f);
+            assert(s.impact_duration_ms == (high ? 200u : 100u));
+            assert(s.impact_id != last_id);
+            last_id = s.impact_id;
+            ++impacts;
+        }
+        if (s.continuous_intensity > 0)
+            assert(s.continuous_intensity == s.continuous_sharpness);
+    } while (!atomic_load_explicit(&rumble_writer_done, memory_order_acquire));
+    assert(pthread_join(thread, NULL) == 0);
+    assert(impacts > 0);
+    nfsu2_input_clear_rumble();
+    nfsu2_input_report_rumble(NAN, INFINITY);
+    nfsu2_input_trigger_impact(INFINITY, NAN, 100u);
+    NFSU2RumbleSnapshot s;
+    assert(!nfsu2_input_poll_rumble(&s));
+    puts("PASS: test_rumble_concurrent_coherent_messages (100000 reports + nonfinite input)");
+}
+
 int main(void) {
     printf("=== Running NFSU2InputBridge Tests ===\n");
     test_initial_and_clear();
@@ -428,6 +475,7 @@ int main(void) {
     test_rumble_impact_trigger_and_consumption();
     test_rumble_impact_coalescing();
     test_rumble_clear_and_disabled();
+    test_rumble_concurrent_coherent_messages();
     printf("=== All NFSU2InputBridge Tests PASSED ===\n");
     return 0;
 }

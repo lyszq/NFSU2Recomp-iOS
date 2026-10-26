@@ -1,2 +1,2 @@
-Public runner / private IO request 2026-10-25 - v0.27.0 build 35 (rev 2); non-optional CHHapticEngine stoppedHandler/resetHandler closure cleanup in ControllerSettings.swift.
+Public runner / private IO request 2026-10-26 - v0.27.2 build 37; normal HumanDriver telemetry, corrected collision body chain, coherent atomic rumble and controller playback lifecycle.
 Owner-reviewed environment required.

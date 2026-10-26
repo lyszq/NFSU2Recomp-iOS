@@ -71,23 +71,31 @@ private final class ControllerHaptics {
     private let queue = DispatchQueue(label: "dev.lyszq.nfsu2.controller-haptics")
     private var engine: CHHapticEngine?
     private var engineRunning = false
-    private var continuousPlayer: CHHapticAdvancedPatternPlayer?
+    private var impactPlayer: CHHapticPatternPlayer?
+    private var continuousPlayer: CHHapticPatternPlayer?
     private var continuousActive = false
-    private var lastContinuousIntensity: Float = -1.0
-    private var lastContinuousSharpness: Float = -1.0
-    private var status: ((String, Bool) -> Void)?
+    private var continuousRefreshAt: TimeInterval = 0
+    private var status: ((String, Bool, Bool) -> Void)?
+    private var playbackFailed = false
+    private var lastFailureReport: TimeInterval = -10
+    private var retryPlaybackAt: TimeInterval = 0
+    private var impactStarts: UInt64 = 0
+    private var continuousStarts: UInt64 = 0
+    private var playbackErrors: UInt64 = 0
 
-    func attach(_ controller: GCController?, status: @escaping (String, Bool) -> Void) {
+    func attach(_ controller: GCController?, status: @escaping (String, Bool, Bool) -> Void) {
         queue.async {
             self.releaseEngine()
             self.status = status
+            self.playbackFailed = false
+            self.retryPlaybackAt = 0
             guard let controller else { self.report("Kontrolcü bağlı değil"); return }
             guard let haptics = controller.haptics, !haptics.supportedLocalities.isEmpty else {
                 self.report("Bu kontrolcü / bağlantı titreşim sunmuyor")
                 return
             }
             guard let engine = haptics.createEngine(withLocality: .default) else {
-                self.report("Kontrolcü titreşim motoru oluşturulamadı")
+                self.report("Kontrolcü titreşim motoru oluşturulamadı; yeniden denenecek", retryAttachment: true)
                 return
             }
             self.engine = engine
@@ -97,28 +105,17 @@ private final class ControllerHaptics {
                 guard let self else { return }
                 self.queue.async {
                     guard let engine, self.engine === engine else { return }
-                    self.continuousPlayer = nil
-                    self.continuousActive = false
+                    self.discardPlayers()
                     self.engineRunning = false
-                    self.lastContinuousIntensity = -1.0
-                    self.lastContinuousSharpness = -1.0
                 }
             }
             engine.resetHandler = { [weak self, weak engine] in
                 guard let self else { return }
                 self.queue.async {
                     guard let engine, self.engine === engine else { return }
-                    self.continuousPlayer = nil
-                    self.continuousActive = false
+                    self.discardPlayers()
                     self.engineRunning = false
-                    self.lastContinuousIntensity = -1.0
-                    self.lastContinuousSharpness = -1.0
-                    do {
-                        try self.engine?.start()
-                        self.engineRunning = true
-                    } catch {
-                        self.engineRunning = false
-                    }
+                    // Restart on the next live request; a reset can arrive while paused.
                 }
             }
             self.report("Kontrolcü titreşimi kullanılabilir")
@@ -136,10 +133,14 @@ private final class ControllerHaptics {
     }
 
     func playImpact(intensity: Float, sharpness: Float, durationMs: UInt32, strength: Float) {
-        guard strength > 0.05, intensity > 0.01 else { return }
+        guard strength.isFinite, intensity.isFinite, sharpness.isFinite,
+              strength > 0.001, intensity > 0.01 else { return }
+        let sampledAt = ProcessInfo.processInfo.systemUptime
         queue.async { [weak self] in
             guard let self else { return }
-            let scaledIntensity = Float(min(max(Double(intensity * strength), 0.18), 1.0))
+            let now = ProcessInfo.processInfo.systemUptime
+            guard now - sampledAt < 0.3, now >= self.retryPlaybackAt else { return }
+            let scaledIntensity = min(max(intensity * strength, 0), 1)
             let clampedSharpness = min(max(sharpness, 0.1), 1.0)
             let durationSec = min(max(Double(durationMs) / 1000.0, 0.06), 0.30)
 
@@ -165,7 +166,11 @@ private final class ControllerHaptics {
             func playPattern(on engine: CHHapticEngine) throws {
                 let pattern = try CHHapticPattern(events: [transientEvent, continuousEvent], parameters: [])
                 let player = try engine.makePlayer(with: pattern)
+                try? self.impactPlayer?.stop(atTime: CHHapticTimeImmediate)
+                self.impactPlayer = player
                 try player.start(atTime: CHHapticTimeImmediate)
+                self.impactStarts &+= 1
+                self.reportRecovery()
             }
 
             do {
@@ -173,86 +178,59 @@ private final class ControllerHaptics {
                 guard let engine = self.engine else { return }
                 try playPattern(on: engine)
             } catch {
-                self.engineRunning = false
-                do {
-                    try self.ensureRunningEngine()
-                    guard let engine = self.engine else { return }
-                    try playPattern(on: engine)
-                } catch {
-                    self.report("Darbe titreşimi çalınamadı: \(error.localizedDescription)")
-                }
+                self.handlePlaybackFailure(error, operation: "Darbe titreşimi")
             }
         }
     }
 
     func updateContinuous(intensity: Float, sharpness: Float, strength: Float) {
+        let sampledAt = ProcessInfo.processInfo.systemUptime
         queue.async { [weak self] in
             guard let self else { return }
-            if intensity <= 0.01 || strength <= 0.05 {
+            let now = ProcessInfo.processInfo.systemUptime
+            if !intensity.isFinite || !sharpness.isFinite || !strength.isFinite ||
+                intensity <= 0.01 || strength <= 0.001 || now - sampledAt >= 0.3 {
                 if self.continuousActive {
                     try? self.continuousPlayer?.stop(atTime: CHHapticTimeImmediate)
                     self.continuousActive = false
-                    self.lastContinuousIntensity = -1.0
-                    self.lastContinuousSharpness = -1.0
+                    self.continuousRefreshAt = 0
                 }
                 return
             }
+            guard now >= self.retryPlaybackAt else { return }
+            guard !self.continuousActive || now >= self.continuousRefreshAt else { return }
 
-            let scaledIntensity = Float(min(max(Double(intensity * strength), 0.08), 1.0))
+            let scaledIntensity = min(max(intensity * strength, 0), 1)
             let clampedSharpness = min(max(sharpness, 0.05), 1.0)
 
             do {
                 try self.ensureRunningEngine()
                 guard let engine = self.engine else { return }
 
-                var justStarted = false
-                if self.continuousPlayer == nil {
-                    let event = CHHapticEvent(
-                        eventType: .hapticContinuous,
-                        parameters: [
-                            CHHapticEventParameter(parameterID: .hapticIntensity, value: 0.5),
-                            CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.5)
-                        ],
-                        relativeTime: 0,
-                        duration: 30.0
-                    )
-                    let pattern = try CHHapticPattern(events: [event], parameters: [])
-                    let advancedPlayer = try engine.makeAdvancedPlayer(with: pattern)
-                    advancedPlayer.loopEnabled = true
-                    self.continuousPlayer = advancedPlayer
-                }
-
-                guard let player = self.continuousPlayer else { return }
-
-                if !self.continuousActive {
-                    try player.start(atTime: CHHapticTimeImmediate)
-                    self.continuousActive = true
-                    justStarted = true
-                }
-
-                let intensityDiff = abs(scaledIntensity - self.lastContinuousIntensity)
-                let sharpnessDiff = abs(clampedSharpness - self.lastContinuousSharpness)
-                if justStarted || intensityDiff > 0.02 || sharpnessDiff > 0.02 {
-                    let intensityParam = CHHapticDynamicParameter(
-                        parameterID: .hapticIntensityControl,
-                        value: scaledIntensity,
-                        relativeTime: 0
-                    )
-                    let sharpnessParam = CHHapticDynamicParameter(
-                        parameterID: .hapticSharpnessControl,
-                        value: clampedSharpness,
-                        relativeTime: 0
-                    )
-                    try player.sendParameters([intensityParam, sharpnessParam], atTime: CHHapticTimeImmediate)
-                    self.lastContinuousIntensity = scaledIntensity
-                    self.lastContinuousSharpness = clampedSharpness
-                }
+                // Use a fresh finite pattern with its actual event values. This
+                // avoids pre-start dynamic parameters and restarting a live player.
+                // Players are lightweight; a sustained road effect needs at most
+                // five replacements per second, with no permanently looping motor.
+                let event = CHHapticEvent(
+                    eventType: .hapticContinuous,
+                    parameters: [
+                        CHHapticEventParameter(parameterID: .hapticIntensity, value: scaledIntensity),
+                        CHHapticEventParameter(parameterID: .hapticSharpness, value: clampedSharpness)
+                    ],
+                    relativeTime: 0,
+                    duration: 0.30
+                )
+                let pattern = try CHHapticPattern(events: [event], parameters: [])
+                let player = try engine.makePlayer(with: pattern)
+                try? self.continuousPlayer?.stop(atTime: CHHapticTimeImmediate)
+                self.continuousPlayer = player
+                try player.start(atTime: CHHapticTimeImmediate)
+                self.continuousActive = true
+                self.continuousRefreshAt = now + 0.20
+                self.continuousStarts &+= 1
+                self.reportRecovery()
             } catch {
-                self.engineRunning = false
-                self.continuousPlayer = nil
-                self.continuousActive = false
-                self.lastContinuousIntensity = -1.0
-                self.lastContinuousSharpness = -1.0
+                self.handlePlaybackFailure(error, operation: "Yol titreşimi")
             }
         }
     }
@@ -263,37 +241,65 @@ private final class ControllerHaptics {
 
     func stop() {
         queue.async {
-            if let player = self.continuousPlayer {
-                try? player.stop(atTime: CHHapticTimeImmediate)
-                self.continuousPlayer = nil
-            }
-            self.continuousActive = false
-            self.lastContinuousIntensity = -1.0
-            self.lastContinuousSharpness = -1.0
-            self.engineRunning = false
-            self.engine?.stop(completionHandler: nil)
+            self.stopPlayers()
+            // Keep the engine for temporary pauses. An asynchronous engine stop
+            // could otherwise finish after the next synchronous start.
+        }
+    }
+
+    private func discardPlayers() {
+        impactPlayer = nil
+        continuousPlayer = nil
+        continuousActive = false
+        continuousRefreshAt = 0
+    }
+
+    private func stopPlayers() {
+        try? impactPlayer?.stop(atTime: CHHapticTimeImmediate)
+        try? continuousPlayer?.stop(atTime: CHHapticTimeImmediate)
+        discardPlayers()
+    }
+
+    private func handlePlaybackFailure(_ error: Error, operation: String) {
+        stopPlayers()
+        engineRunning = false
+        playbackFailed = true
+        playbackErrors &+= 1
+        let now = ProcessInfo.processInfo.systemUptime
+        retryPlaybackAt = now + 1
+        if now - lastFailureReport >= 5 {
+            lastFailureReport = now
+            report("\(operation) çalınamadı: \(error.localizedDescription); yeniden denenecek")
+        }
+    }
+
+    private func reportRecovery() {
+        if playbackFailed {
+            playbackFailed = false
+            report("Kontrolcü titreşimi yeniden çalışıyor")
+        }
+    }
+
+    func readDiagnostics(_ completion: @escaping (UInt64, UInt64, UInt64) -> Void) {
+        queue.async {
+            let values = (self.impactStarts, self.continuousStarts, self.playbackErrors)
+            DispatchQueue.main.async { completion(values.0, values.1, values.2) }
         }
     }
 
     private func releaseEngine() {
-        if let player = continuousPlayer {
-            try? player.stop(atTime: CHHapticTimeImmediate)
-            continuousPlayer = nil
-        }
-        continuousActive = false
+        stopPlayers()
         engineRunning = false
-        lastContinuousIntensity = -1.0
-        lastContinuousSharpness = -1.0
         engine?.stoppedHandler = { _ in }
         engine?.resetHandler = {}
         engine?.stop(completionHandler: nil)
         engine = nil
     }
 
-    private func report(_ message: String) {
+    private func report(_ message: String, retryAttachment: Bool = false) {
         let callback = status
         let available = engine != nil
-        DispatchQueue.main.async { callback?(message, available) }
+        DispatchQueue.main.async { callback?(message, available, retryAttachment) }
     }
 }
 
@@ -304,6 +310,8 @@ public final class GameControllerManager: ObservableObject {
     @Published public private(set) var batteryLevel: Float?
     @Published private(set) var hapticsStatus = "Kontrolcü bağlı değil"
     @Published private(set) var supportsControllerHaptics = false
+    @Published private(set) var rumbleDiagnostics = "Henüz oyun titreşimi örneği yok"
+    @Published private(set) var hapticsPlaybackDiagnostics = "Oynatıcı: 0 darbe · 0 yol · 0 hata"
     @Published var preferences = ControllerPreferences.load() {
         didSet {
             if let data = try? JSONEncoder().encode(preferences) {
@@ -321,9 +329,15 @@ public final class GameControllerManager: ObservableObject {
     private var menuOpen = false
     private var active = false
     private var lastImpactId: UInt32 = 0
+    private var rumblePolls: UInt64 = 0
+    private var receivedImpacts: UInt64 = 0
+    private var receivedContinuousTicks: UInt64 = 0
+    private var retryHapticsAttachment = false
+    private var nextAttachmentRetryAt: TimeInterval = 0
     private let haptics = ControllerHaptics()
     private var observers: [NSObjectProtocol] = []
     private var batteryTimer: Timer?
+    private var rumbleDiagnosticsTimer: Timer?
 
     private init() {
         for name in [Notification.Name.GCControllerDidConnect, .GCControllerDidDisconnect,
@@ -333,6 +347,9 @@ public final class GameControllerManager: ObservableObject {
             })
         }
         batteryTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in self?.refreshBattery() }
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.refreshRumbleDiagnostics() }
+        RunLoop.main.add(timer, forMode: .common)
+        rumbleDiagnosticsTimer = timer
         checkForExistingControllers()
     }
 
@@ -349,12 +366,9 @@ public final class GameControllerManager: ObservableObject {
         isControllerConnected = next != nil
         connectedControllerName = next?.vendorName ?? (next == nil ? nil : "Kablosuz oyun kolu")
         supportsControllerHaptics = false
+        retryHapticsAttachment = false
         refreshBattery()
-        haptics.attach(next) { [weak self, weak next] message, available in
-            guard let self, self.controller === next else { return }
-            self.hapticsStatus = message
-            self.supportsControllerHaptics = available
-        }
+        attachHaptics(to: next)
         if let pad = next?.extendedGamepad {
             pad.valueChangedHandler = { [weak self, weak next] _, _ in
                 guard let self, let next, self.controller === next else { return }
@@ -394,6 +408,9 @@ public final class GameControllerManager: ObservableObject {
     public func pollRumbleTick() {
         var snapshot = NFSU2RumbleSnapshot()
         _ = nfsu2_input_poll_rumble(&snapshot)
+        rumblePolls &+= 1
+        if snapshot.impact_intensity > 0.01 { receivedImpacts &+= 1 }
+        if snapshot.continuous_intensity > 0.01 { receivedContinuousTicks &+= 1 }
 
         let isActive = self.active && !self.menuOpen
         let hasConnectedController = self.isControllerConnected && self.controller != nil
@@ -418,6 +435,45 @@ public final class GameControllerManager: ObservableObject {
             lastImpactId = snapshot.impact_id
             haptics.updateContinuous(intensity: 0, sharpness: 0, strength: 0)
         }
+    }
+
+    private func attachHaptics(to target: GCController?) {
+        haptics.attach(target) { [weak self, weak target] message, available, retryAttachment in
+            guard let self, self.controller === target else { return }
+            self.hapticsStatus = message
+            self.supportsControllerHaptics = available
+            self.retryHapticsAttachment = retryAttachment
+            self.nextAttachmentRetryAt = ProcessInfo.processInfo.systemUptime + 5
+        }
+    }
+
+    private func refreshRumbleDiagnostics() {
+        var producer = NFSU2RumbleDiagnostics()
+        nfsu2_input_get_rumble_diagnostics(&producer)
+        let gate: String
+        switch producer.last_gate {
+        case 1: gate = "Araç adresi geçersiz"
+        case 2: gate = "Yerel olmayan araç"
+        case 3: gate = "Yarış duraklatılmış / etkin değil"
+        case 4: gate = "Yerel oyuncu aktif"
+        default: gate = "Henüz fizik çağrısı yok"
+        }
+        rumbleDiagnostics = "\(gate)\nFizik: \(producer.hook_calls) çağrı · \(producer.local_samples) yerel · \(producer.gated_samples) engellenen\nÜretim: \(producer.impact_reports) darbe · \(producer.continuous_reports) yol\nKöprü: \(rumblePolls) okuma · \(receivedImpacts) darbe · \(receivedContinuousTicks) yol örneği"
+        haptics.readDiagnostics { [weak self] impacts, continuous, errors in
+            self?.hapticsPlaybackDiagnostics = "Oynatıcı: \(impacts) darbe · \(continuous) yol başlangıcı · \(errors) hata"
+        }
+        // Retry transient engine-creation failures; unsupported hardware does not
+        // request a retry and must not be reattached on every display tick.
+        if retryHapticsAttachment, active, !menuOpen, preferences.vibration,
+           let controller, ProcessInfo.processInfo.systemUptime >= nextAttachmentRetryAt {
+            retryHapticsAttachment = false
+            attachHaptics(to: controller)
+        }
+    }
+
+    func suspendRumble() {
+        nfsu2_input_clear_rumble()
+        haptics.stop()
     }
 
     private func refreshBattery() {
@@ -566,6 +622,13 @@ struct GameSettingsPanel: View {
                         .disabled(!controller.supportsControllerHaptics || !controller.preferences.vibration)
                     Text("Çarpışma darbeleri, duvar sürtmesi, yol yüzeyi, lastik kayması ve tuş geri bildirim titreşimlerini kontrol eder.")
                         .font(.footnote).foregroundStyle(.secondary)
+                    DisclosureGroup("Titreşim tanısı") {
+                        Text(controller.rumbleDiagnostics)
+                        Text(controller.hapticsPlaybackDiagnostics)
+                        Text("Sayaçlar bu açılış içindir. Oynatıcı sayacı, Core Haptics çağrısının kabulünü gösterir; kolda hissedildiğini doğrulamaz.")
+                    }
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
                     Button("Kontrolcü ayarlarını varsayılana döndür") { controller.preferences = ControllerPreferences() }
                 }
             }

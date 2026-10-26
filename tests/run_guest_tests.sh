@@ -78,6 +78,8 @@ done
 "$DEST/guest-file-test"
 "$CC" "${FLAGS[@]}" runtime/guest_cursor.c ios/NFSU2iOS/Native/NFSU2InputBridge.c tests/input_bridge_test.c -o "$DEST/input-bridge-test" "${LIBS[@]}"
 "$DEST/input-bridge-test"
+"$CC" "${FLAGS[@]}" runtime/guest_cursor.c ios/NFSU2iOS/Native/NFSU2InputBridge.c tests/game_rumble_test.c -o "$DEST/game-rumble-test" "${LIBS[@]}"
+"$DEST/game-rumble-test"
 "$CC" "${FLAGS[@]}" -c runtime/dispatch.c -o "$DEST/desktop-dispatch.o"
 "$CC" "${FLAGS[@]}" runtime/guest_memory.c tests/guest_memory_test.c -o "$DEST/guest-memory-test"
 "$CC" "${FLAGS[@]}" runtime/guest_memory.c runtime/guest_pe.c tests/guest_pe_test.c -o "$DEST/guest-pe-test"
