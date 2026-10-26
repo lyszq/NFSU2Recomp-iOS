@@ -135,11 +135,11 @@ private final class ControllerHaptics {
         }
     }
 
-    func playImpact(intensity: Float, sharpness: Float, durationMs: UInt32, strength: Double) {
+    func playImpact(intensity: Float, sharpness: Float, durationMs: UInt32, strength: Float) {
         guard strength > 0.05, intensity > 0.01 else { return }
         queue.async { [weak self] in
             guard let self else { return }
-            let scaledIntensity = Float(min(max(Double(intensity) * strength, 0.18), 1.0))
+            let scaledIntensity = Float(min(max(Double(intensity * strength), 0.18), 1.0))
             let clampedSharpness = min(max(sharpness, 0.1), 1.0)
             let durationSec = min(max(Double(durationMs) / 1000.0, 0.06), 0.30)
 
@@ -185,11 +185,7 @@ private final class ControllerHaptics {
         }
     }
 
-    func playImpact(intensity: Float, sharpness: Float, durationMs: UInt32, strength: Float) {
-        playImpact(intensity: intensity, sharpness: sharpness, durationMs: durationMs, strength: Double(strength))
-    }
-
-    func updateContinuous(intensity: Float, sharpness: Float, strength: Double) {
+    func updateContinuous(intensity: Float, sharpness: Float, strength: Float) {
         queue.async { [weak self] in
             guard let self else { return }
             if intensity <= 0.01 || strength <= 0.05 {
@@ -202,7 +198,7 @@ private final class ControllerHaptics {
                 return
             }
 
-            let scaledIntensity = Float(min(max(Double(intensity) * strength, 0.08), 1.0))
+            let scaledIntensity = Float(min(max(Double(intensity * strength), 0.08), 1.0))
             let clampedSharpness = min(max(sharpness, 0.05), 1.0)
 
             do {
@@ -261,12 +257,8 @@ private final class ControllerHaptics {
         }
     }
 
-    func updateContinuous(intensity: Float, sharpness: Float, strength: Float) {
-        updateContinuous(intensity: intensity, sharpness: sharpness, strength: Double(strength))
-    }
-
     func pulse(strength: Float) {
-        playImpact(intensity: 0.9, sharpness: 0.65, durationMs: 160, strength: Double(strength))
+        playImpact(intensity: 0.9, sharpness: 0.65, durationMs: 160, strength: strength)
     }
 
     func stop() {
