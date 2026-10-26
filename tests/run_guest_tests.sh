@@ -92,6 +92,7 @@ if [[ "$(uname -s)" == Darwin ]]; then
   "$CC" "${FLAGS[@]}" tests/metal_framebuffer_pool_test.c -o "$DEST/metal-framebuffer-pool-test"
   "$DEST/metal-framebuffer-pool-test"
   python3 tests/ios_file_storage_test.py "$DEST"
+  python3 tests/input_lifecycle_test.py "$DEST"
   python3 tools/ios_private/typecheck_full_ui.py
   # Compile the production thread/timer call paths, including iOS-only branches.
   # This uses authored source only; no generated game functions or input EXE.

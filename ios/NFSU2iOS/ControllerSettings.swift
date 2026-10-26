@@ -1,6 +1,7 @@
 import SwiftUI
 import GameController
 import CoreHaptics
+import UIKit
 
 enum ControllerAction: String, CaseIterable, Codable, Identifiable {
     case confirm, back, pause, handbrake, nitro, camera, reset, lookBack, shiftDown, shiftUp, none
@@ -326,8 +327,9 @@ public final class GameControllerManager: ObservableObject {
     private var controller: GCController?
     private var keys = Set<UInt8>()
     private var suppressedKeys = Set<UInt8>()
-    private var menuOpen = false
-    private var active = false
+    private var inputLifecycle = GameInputLifecycle()
+    private var menuOpen: Bool { inputLifecycle.settingsOpen }
+    private var active: Bool { inputLifecycle.sessionActive && inputLifecycle.applicationActive }
     private var lastImpactId: UInt32 = 0
     private var rumblePolls: UInt64 = 0
     private var receivedImpacts: UInt64 = 0
@@ -340,6 +342,7 @@ public final class GameControllerManager: ObservableObject {
     private var rumbleDiagnosticsTimer: Timer?
 
     private init() {
+        inputLifecycle.applicationActive = UIApplication.shared.applicationState == .active
         for name in [Notification.Name.GCControllerDidConnect, .GCControllerDidDisconnect,
                      .GCControllerDidBecomeCurrent, .GCControllerDidStopBeingCurrent] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
@@ -353,10 +356,10 @@ public final class GameControllerManager: ObservableObject {
         checkForExistingControllers()
     }
 
-    public func checkForExistingControllers() {
+    public func checkForExistingControllers(forceRebind: Bool = false) {
         let available = GCController.controllers()
         let next = GCController.current.flatMap { current in available.first { $0 === current } } ?? available.first
-        if controller === next { refreshBattery(); return }
+        if controller === next && !forceRebind { refreshBattery(); return }
         controller?.extendedGamepad?.valueChangedHandler = nil
         controller?.microGamepad?.valueChangedHandler = nil
         releaseInput()
@@ -384,7 +387,19 @@ public final class GameControllerManager: ObservableObject {
     }
 
     func setActive(_ value: Bool) {
-        active = value
+        inputLifecycle.sessionActive = value
+        applyInputLifecycle()
+    }
+
+    func setApplicationActive(_ value: Bool) {
+        guard inputLifecycle.applicationActive != value else { return }
+        inputLifecycle.applicationActive = value
+        if value { checkForExistingControllers(forceRebind: true) }
+        applyInputLifecycle()
+    }
+
+    private func applyInputLifecycle() {
+        inputLifecycle.applyToBridge()
         releaseInput()
         armNeutralGate()
         haptics.stop()
@@ -392,12 +407,9 @@ public final class GameControllerManager: ObservableObject {
     }
 
     func setMenuOpen(_ value: Bool) {
-        menuOpen = value
-        releaseInput()
-        armNeutralGate()
-        haptics.stop()
+        inputLifecycle.settingsOpen = value
+        applyInputLifecycle()
         refreshBattery()
-        sample()
     }
 
     func tryVibration() {

@@ -61,6 +61,7 @@ void nfsu2_input_clear_controller(void);
 
 /* Uygulama menüsü/background sırasında bütün oyun girişini kapatır. */
 void nfsu2_input_set_enabled(bool enabled);
+bool nfsu2_input_is_enabled(void);
 
 /* Tüm tuş tamponunu (g_keys) sıfırlar (arka plana atılınca, kopmada veya duraklatmada çağrılır) */
 void nfsu2_input_clear_all(void);

@@ -1,2 +1,2 @@
-Public runner / private IO request 2026-10-26 - v0.27.2 build 37; normal HumanDriver telemetry, corrected collision body chain, coherent atomic rumble and controller playback lifecycle.
+Public runner / private IO request 2026-10-26 - v0.27.3 build 38; restore shared touch/controller input on UIKit foreground activation, one input gate owner, retained build37 gameplay rumble.
 Owner-reviewed environment required.

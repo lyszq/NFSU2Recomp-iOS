@@ -75,6 +75,7 @@ on:
       - 'tests/guest_process*'
       - 'tests/guest_time*'
       - 'tests/input_bridge*'
+      - 'tests/input_lifecycle*'
       - 'tests/game_rumble*'
       - 'tests/ios_file_storage*'
       - 'tests/run_guest_tests.sh'

@@ -268,7 +268,7 @@ class Builder:
         # Use the existing package inspector unchanged; never weaken historical
         # private-Actions provenance verification to accept this new lane.
         from verify_full_package import inspect_package
-        info, binary_bytes, segments = inspect_package(ipa, source, version="0.27.2", build="37")
+        info, binary_bytes, segments = inspect_package(ipa, source, version="0.27.3", build="38")
         report = {"source_sha": source, "ipa_sha256": sha256(ipa), "binary_sha256": hashlib.sha256(binary_bytes).hexdigest(),
                   "version": info["CFBundleShortVersionString"], "build": info["CFBundleVersion"], "segments": segments}
         (self.evidence / "package-verification.json").write_text(json.dumps(report, indent=2) + "\n")

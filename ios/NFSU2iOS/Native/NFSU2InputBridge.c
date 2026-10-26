@@ -157,6 +157,10 @@ void nfsu2_input_clear_controller(void) {
     nfsu2_input_clear_rumble();
 }
 
+bool nfsu2_input_is_enabled(void) {
+    return input_enabled();
+}
+
 void nfsu2_input_set_enabled(bool enabled) {
     if (enabled) {
         atomic_store_explicit(&g_input_enabled, true, memory_order_release);

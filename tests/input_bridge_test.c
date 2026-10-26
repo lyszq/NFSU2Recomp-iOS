@@ -414,6 +414,27 @@ static void test_rumble_clear_and_disabled(void) {
     printf("PASS: test_rumble_clear_and_disabled\n");
 }
 
+static void test_background_foreground_both_sources(void) {
+    for (unsigned cycle = 0; cycle < 50; ++cycle) {
+        nfsu2_input_set_enabled(true);
+        nfsu2_input_set_key(NFSU2_DIK_UP, true);
+        nfsu2_input_set_controller_key(NFSU2_DIK_LEFT, true);
+        assert(nfsu2_input_active_count() == 2);
+        nfsu2_input_set_enabled(false);
+        assert(!nfsu2_input_is_enabled() && nfsu2_input_active_count() == 0);
+        nfsu2_input_set_key(NFSU2_DIK_UP, true);
+        nfsu2_input_set_controller_key(NFSU2_DIK_LEFT, true);
+        nfsu2_input_set_enabled(true);
+        assert(nfsu2_input_is_enabled() && nfsu2_input_active_count() == 0);
+        nfsu2_input_set_key(NFSU2_DIK_UP, true);
+        nfsu2_input_set_controller_key(NFSU2_DIK_LEFT, true);
+        uint8_t keyboard[256]; nfsu2_input_fill_keyboard(keyboard, sizeof(keyboard));
+        assert(keyboard[NFSU2_DIK_UP] == 0x80 && keyboard[NFSU2_DIK_LEFT] == 0x80);
+        nfsu2_input_clear_all();
+    }
+    puts("PASS: test_background_foreground_both_sources (50 cycles)");
+}
+
 static _Atomic bool rumble_writer_done;
 static void *rumble_writer(void *unused) {
     (void)unused;
@@ -476,6 +497,7 @@ int main(void) {
     test_rumble_impact_coalescing();
     test_rumble_clear_and_disabled();
     test_rumble_concurrent_coherent_messages();
+    test_background_foreground_both_sources();
     printf("=== All NFSU2InputBridge Tests PASSED ===\n");
     return 0;
 }

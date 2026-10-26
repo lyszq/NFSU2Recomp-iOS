@@ -656,7 +656,7 @@ public final class NFSU2MetalRenderUIView: UIView {
 
     @objc private func applicationWillResignActive(_ notification: Notification) {
         stopDisplayLink()
-        GameControllerManager.shared.suspendRumble()
+        GameControllerManager.shared.setApplicationActive(false)
         primaryPointerTouch = nil
         pointerTouchToken &+= 1
         nfsu2_input_clear_all()
@@ -668,7 +668,7 @@ public final class NFSU2MetalRenderUIView: UIView {
     
     @objc private func applicationDidEnterBackground(_ notification: Notification) {
         stopDisplayLink()
-        GameControllerManager.shared.suspendRumble()
+        GameControllerManager.shared.setApplicationActive(false)
         primaryPointerTouch = nil
         pointerTouchToken &+= 1
         nfsu2_input_clear_all()
@@ -679,6 +679,7 @@ public final class NFSU2MetalRenderUIView: UIView {
     }
     
     @objc private func applicationDidBecomeActive(_ notification: Notification) {
+        GameControllerManager.shared.setApplicationActive(true)
         startDisplayLink()
 #if NFS_FULL_RUNTIME
         nfs_game_session_set_active(1)
@@ -989,17 +990,16 @@ public struct GameMetalView: View {
                 set: { touchMode = $0 ? 1 : 2 })
     }
 
-    private var gameInputSessionActive: Bool {
+    private var gameInputSessionRequested: Bool {
 #if NFS_FULL_RUNTIME
-        startRuntimeRequested && scenePhase == .active
+        startRuntimeRequested
 #else
-        scenePhase == .active
+        true
 #endif
     }
 
     private func openSettings() {
         controllerManager.setMenuOpen(true)
-        nfsu2_input_set_enabled(false)
         nfsu2_input_clear_all()
         nfsu2_input_set_cursor_available(false)
         touchGeneration = UUID()
@@ -1061,8 +1061,7 @@ public struct GameMetalView: View {
                     Button {
                         startRuntimeRequested = true
                         nfsu2_input_clear_all()
-                        nfsu2_input_set_enabled(scenePhase == .active)
-                        controllerManager.setActive(scenePhase == .active)
+                        controllerManager.setActive(true)
                     } label: {
                         Label("START FULL RUNTIME", systemImage: "play.fill")
                             .fontWeight(.bold)
@@ -1125,7 +1124,6 @@ public struct GameMetalView: View {
         .allowsHitTesting(!showSettings)
         .sheet(isPresented: $showSettings, onDismiss: {
             nfsu2_input_clear_all()
-            nfsu2_input_set_enabled(gameInputSessionActive)
             controllerManager.setMenuOpen(false)
             touchGeneration = UUID()
         }) { settingsPanel }
@@ -1135,15 +1133,14 @@ public struct GameMetalView: View {
         }
 #endif
         .onAppear {
-            nfsu2_input_set_enabled(gameInputSessionActive && !showSettings)
             controllerManager.checkForExistingControllers()
-            controllerManager.setActive(gameInputSessionActive)
+            controllerManager.setMenuOpen(showSettings)
+            controllerManager.setActive(gameInputSessionRequested)
 #if NFS_FULL_RUNTIME
             nfs_game_session_set_active(1)
 #endif
         }
         .onDisappear {
-            nfsu2_input_set_enabled(false)
             controllerManager.setActive(false)
             nfsu2_input_clear_all()
 #if NFS_FULL_RUNTIME
@@ -1151,19 +1148,15 @@ public struct GameMetalView: View {
 #endif
         }
         .onChange(of: scenePhase) { phase in
-            nfsu2_input_set_enabled(gameInputSessionActive && !showSettings)
-            controllerManager.setActive(gameInputSessionActive)
+            // UIKit's activation callback restores both common input and runtime.
+            // SwiftUI only rebuilds interrupted touch gestures; it cannot leave
+            // the bridge disabled using a captured/late scenePhase value.
             touchGeneration = UUID()
             if phase != .active {
                 // Uygulama arka plana geçtiğinde veya kesintiye uğradığında takılı tuşları sıfırla
                 nfsu2_input_clear_all()
 #if NFS_FULL_RUNTIME
                 nfsu2_input_set_cursor_available(false)
-                nfs_game_session_set_active(0)
-#endif
-            } else {
-#if NFS_FULL_RUNTIME
-                nfs_game_session_set_active(1)
 #endif
             }
         }
