@@ -48,6 +48,19 @@ static _Atomic uint32_t g_input_event_sequence;
 static _Atomic uint32_t g_input_event_reset_sequence_base;
 static _Atomic bool g_input_event_overflow;
 
+/*
+ * Titreşim (Rumble) Durum Değişkenleri
+ * Lock-free atomic fixed-point (0..10000 = 0.0f..1.0f) ve monotonik sayaçlar.
+ */
+static _Atomic uint32_t g_rumble_continuous_intensity;
+static _Atomic uint32_t g_rumble_continuous_sharpness;
+static _Atomic uint32_t g_rumble_continuous_ttl;
+static _Atomic uint32_t g_rumble_impact_intensity;
+static _Atomic uint32_t g_rumble_impact_sharpness;
+static _Atomic uint32_t g_rumble_impact_duration_ms;
+static _Atomic uint32_t g_rumble_impact_id;
+static _Atomic uint32_t g_rumble_pending_impact;
+
 static bool input_enabled(void) {
     return atomic_load_explicit(&g_input_enabled, memory_order_acquire);
 }
@@ -138,6 +151,7 @@ void nfsu2_input_clear_controller(void) {
         if (input_enabled() && was_pressed && !now_pressed)
             input_queue_edge((uint8_t)i, false);
     }
+    nfsu2_input_clear_rumble();
 }
 
 void nfsu2_input_set_enabled(bool enabled) {
@@ -148,6 +162,7 @@ void nfsu2_input_set_enabled(bool enabled) {
 
     atomic_store_explicit(&g_input_enabled, false, memory_order_release);
     nfsu2_input_clear_all();
+    nfsu2_input_clear_rumble();
     guest_cursor_set_available(false);
 }
 
@@ -167,6 +182,7 @@ void nfsu2_input_clear_all(void) {
     atomic_store_explicit(&g_input_event_overflow, false, memory_order_release);
     atomic_store_explicit(&g_input_event_generation, write_generation,
                           memory_order_release);
+    nfsu2_input_clear_rumble();
 }
 
 bool nfsu2_input_get_key(uint8_t dik_code) {
@@ -366,4 +382,128 @@ bool nfsu2_input_get_cursor_snapshot(int32_t *x, int32_t *y, uint32_t *flags) {
 void nfsu2_input_set_viewport(uint32_t viewport_w, uint32_t viewport_h,
                                uint32_t game_w, uint32_t game_h) {
     guest_cursor_set_viewport(viewport_w, viewport_h, game_w, game_h, GUEST_CURSOR_SCALE_FIT);
+}
+
+/*
+ * Titreşim (Rumble / Haptics) API Fonksiyonları
+ */
+
+void nfsu2_input_clear_rumble(void) {
+    atomic_store_explicit(&g_rumble_continuous_intensity, 0, memory_order_release);
+    atomic_store_explicit(&g_rumble_continuous_sharpness, 0, memory_order_release);
+    atomic_store_explicit(&g_rumble_continuous_ttl, 0, memory_order_release);
+    atomic_store_explicit(&g_rumble_impact_intensity, 0, memory_order_release);
+    atomic_store_explicit(&g_rumble_impact_sharpness, 0, memory_order_release);
+    atomic_store_explicit(&g_rumble_impact_duration_ms, 0, memory_order_release);
+    atomic_store_explicit(&g_rumble_pending_impact, 0, memory_order_release);
+}
+
+void nfsu2_input_report_rumble(float continuous_intensity, float continuous_sharpness) {
+    if (!input_enabled()) {
+        atomic_store_explicit(&g_rumble_continuous_intensity, 0, memory_order_release);
+        atomic_store_explicit(&g_rumble_continuous_sharpness, 0, memory_order_release);
+        atomic_store_explicit(&g_rumble_continuous_ttl, 0, memory_order_release);
+        return;
+    }
+
+    if (continuous_intensity < 0.0f) continuous_intensity = 0.0f;
+    if (continuous_intensity > 1.0f) continuous_intensity = 1.0f;
+    if (continuous_sharpness < 0.0f) continuous_sharpness = 0.0f;
+    if (continuous_sharpness > 1.0f) continuous_sharpness = 1.0f;
+
+    uint32_t int_fixed = (uint32_t)(continuous_intensity * 10000.0f + 0.5f);
+    uint32_t shp_fixed = (uint32_t)(continuous_sharpness * 10000.0f + 0.5f);
+
+    atomic_store_explicit(&g_rumble_continuous_intensity, int_fixed, memory_order_release);
+    atomic_store_explicit(&g_rumble_continuous_sharpness, shp_fixed, memory_order_release);
+
+    if (continuous_intensity > 0.001f) {
+        atomic_store_explicit(&g_rumble_continuous_ttl, 8u, memory_order_release);
+    } else {
+        atomic_store_explicit(&g_rumble_continuous_ttl, 0u, memory_order_release);
+    }
+}
+
+void nfsu2_input_trigger_impact(float intensity, float sharpness, uint32_t duration_ms) {
+    if (!input_enabled()) return;
+
+    if (intensity < 0.0f) intensity = 0.0f;
+    if (intensity > 1.0f) intensity = 1.0f;
+    if (intensity <= 0.01f) return;
+
+    if (sharpness < 0.0f) sharpness = 0.0f;
+    if (sharpness > 1.0f) sharpness = 1.0f;
+
+    if (duration_ms < 60u) duration_ms = 60u;
+    else if (duration_ms > 280u) duration_ms = 280u;
+
+    uint32_t new_int = (uint32_t)(intensity * 10000.0f + 0.5f);
+    uint32_t new_shp = (uint32_t)(sharpness * 10000.0f + 0.5f);
+
+    uint32_t pending = atomic_load_explicit(&g_rumble_pending_impact, memory_order_acquire);
+    if (pending != 0) {
+        uint32_t cur_int = atomic_load_explicit(&g_rumble_impact_intensity, memory_order_acquire);
+        if (new_int <= cur_int) {
+            /* Bekleyen mevcut darbe bu darbeden daha güçlü veya eşit */
+            return;
+        }
+    }
+
+    atomic_store_explicit(&g_rumble_impact_sharpness, new_shp, memory_order_release);
+    atomic_store_explicit(&g_rumble_impact_duration_ms, duration_ms, memory_order_release);
+    atomic_store_explicit(&g_rumble_impact_intensity, new_int, memory_order_release);
+    atomic_fetch_add_explicit(&g_rumble_impact_id, 1u, memory_order_acq_rel);
+    atomic_store_explicit(&g_rumble_pending_impact, 1u, memory_order_release);
+}
+
+bool nfsu2_input_poll_rumble(NFSU2RumbleSnapshot *snapshot) {
+    if (!snapshot) return false;
+
+    if (!input_enabled()) {
+        nfsu2_input_clear_rumble();
+        snapshot->continuous_intensity = 0.0f;
+        snapshot->continuous_sharpness = 0.0f;
+        snapshot->impact_intensity = 0.0f;
+        snapshot->impact_sharpness = 0.0f;
+        snapshot->impact_duration_ms = 0;
+        snapshot->impact_id = atomic_load_explicit(&g_rumble_impact_id, memory_order_acquire);
+        return false;
+    }
+
+    uint32_t ttl = atomic_load_explicit(&g_rumble_continuous_ttl, memory_order_acquire);
+    if (ttl > 0) {
+        atomic_fetch_sub_explicit(&g_rumble_continuous_ttl, 1u, memory_order_acq_rel);
+        uint32_t c_int = atomic_load_explicit(&g_rumble_continuous_intensity, memory_order_acquire);
+        uint32_t c_shp = atomic_load_explicit(&g_rumble_continuous_sharpness, memory_order_acquire);
+        snapshot->continuous_intensity = (float)c_int / 10000.0f;
+        snapshot->continuous_sharpness = (float)c_shp / 10000.0f;
+    } else {
+        atomic_store_explicit(&g_rumble_continuous_intensity, 0, memory_order_release);
+        atomic_store_explicit(&g_rumble_continuous_sharpness, 0, memory_order_release);
+        snapshot->continuous_intensity = 0.0f;
+        snapshot->continuous_sharpness = 0.0f;
+    }
+
+    uint32_t pending = atomic_exchange_explicit(&g_rumble_pending_impact, 0, memory_order_acq_rel);
+    snapshot->impact_id = atomic_load_explicit(&g_rumble_impact_id, memory_order_acquire);
+
+    if (pending != 0) {
+        uint32_t imp_int = atomic_exchange_explicit(&g_rumble_impact_intensity, 0, memory_order_acq_rel);
+        uint32_t imp_shp = atomic_load_explicit(&g_rumble_impact_sharpness, memory_order_acquire);
+        uint32_t imp_dur = atomic_load_explicit(&g_rumble_impact_duration_ms, memory_order_acquire);
+        snapshot->impact_intensity = (float)imp_int / 10000.0f;
+        snapshot->impact_sharpness = (float)imp_shp / 10000.0f;
+        snapshot->impact_duration_ms = imp_dur;
+    } else {
+        snapshot->impact_intensity = 0.0f;
+        snapshot->impact_sharpness = 0.0f;
+        snapshot->impact_duration_ms = 0;
+    }
+
+    return (snapshot->continuous_intensity > 0.001f || snapshot->impact_intensity > 0.001f);
+}
+
+void nfsu2_input_reset(void) {
+    nfsu2_input_clear_all();
+    nfsu2_input_clear_rumble();
 }

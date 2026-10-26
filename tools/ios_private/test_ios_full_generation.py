@@ -74,9 +74,9 @@ def make_generated_fixture(root: Path, override_addresses: list[str], provenance
 class GenerateShardsTests(unittest.TestCase):
     def test_reads_the_authoritative_override_list_from_v2_recipe(self):
         addresses = generate_shards._read_override_addresses(generate_shards.ROOT)
-        self.assertEqual(len(addresses), 35)
+        self.assertEqual(len(addresses), 36)
         self.assertEqual(addresses[0], "0060fab0")
-        self.assertEqual(addresses[-1], "0065ccd8")
+        self.assertEqual(addresses[-1], "00406460")
         self.assertEqual(len(set(addresses)), len(addresses))
 
     def test_rejects_non_128_runtime_configuration(self):
@@ -247,8 +247,8 @@ class ConfigureProjectTests(unittest.TestCase):
             self.assertEqual(base["CLANG_ENABLE_OBJC_ARC"], "YES")
             self.assertIn("NFS_FULL_RUNTIME", base["SWIFT_ACTIVE_COMPILATION_CONDITIONS"])
             self.assertEqual(base["PRODUCT_BUNDLE_IDENTIFIER"], "dev.lyszq.nfsu2ios")
-            self.assertEqual(target["info"]["properties"]["CFBundleShortVersionString"], "0.27.0")
-            self.assertEqual(target["info"]["properties"]["CFBundleVersion"], "35")
+            self.assertEqual(target["info"]["properties"]["CFBundleShortVersionString"], "0.27.1")
+            self.assertEqual(target["info"]["properties"]["CFBundleVersion"], "36")
             self.assertIs(target["info"]["properties"]["UIFileSharingEnabled"], True)
             self.assertIs(target["info"]["properties"]["LSSupportsOpeningDocumentsInPlace"], True)
             self.assertEqual(original["targets"]["NFSU2iOS"]["sources"][1]["path"], "../runtime/guest_execution.c")

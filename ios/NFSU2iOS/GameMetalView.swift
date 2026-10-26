@@ -369,6 +369,7 @@ public struct OnScreenControlsOverlay: View {
     @Binding var showControls: Bool
     @AppStorage("controls.useSlider") private var useAnalogSlider = true
     @AppStorage("controls.manualGears") private var showManualGears = false
+    @AppStorage("controls.showTopButtons") private var showTopButtons = false
     let openSettings: () -> Void
     
     public init(showControls: Binding<Bool>, openSettings: @escaping () -> Void) {
@@ -396,54 +397,60 @@ public struct OnScreenControlsOverlay: View {
             VStack {
                 // ÜST BÖLÜM: Kamera, Harita, Sıfırla, Kontrolcü Durumu, Menü
                 HStack(spacing: isPad ? 12 : 8) {
-                    // Kamera Görünümü (C)
-                    MultiTouchKeyButton(
-                        icon: "camera.viewfinder",
-                        label: "KAMERA",
-                        dikCode: UInt8(NFSU2_DIK_C),
-                        tintColor: .cyan,
-                        size: topBtnSize
-                    )
-                    
-                    // Arkaya Bak (B)
-                    MultiTouchKeyButton(
-                        icon: "eye.fill",
-                        label: "ARKA",
-                        dikCode: UInt8(NFSU2_DIK_B),
-                        tintColor: .teal,
-                        size: topBtnSize
-                    )
-                    
-                    // Aracı Sıfırla (R)
-                    MultiTouchKeyButton(
-                        icon: "arrow.counterclockwise.circle",
-                        label: "SIFIRLA",
-                        dikCode: UInt8(NFSU2_DIK_R),
-                        tintColor: .orange,
-                        size: topBtnSize
-                    )
-                    
+                    if showTopButtons {
+                        // Kamera Görünümü (C)
+                        MultiTouchKeyButton(
+                            icon: "camera.viewfinder",
+                            label: "KAMERA",
+                            dikCode: UInt8(NFSU2_DIK_C),
+                            tintColor: .cyan,
+                            size: topBtnSize
+                        )
+
+                        // Arkaya Bak (B)
+                        MultiTouchKeyButton(
+                            icon: "eye.fill",
+                            label: "ARKA",
+                            dikCode: UInt8(NFSU2_DIK_B),
+                            tintColor: .teal,
+                            size: topBtnSize
+                        )
+
+                        // Aracı Sıfırla (R)
+                        MultiTouchKeyButton(
+                            icon: "arrow.counterclockwise.circle",
+                            label: "SIFIRLA",
+                            dikCode: UInt8(NFSU2_DIK_R),
+                            tintColor: .orange,
+                            size: topBtnSize
+                        )
+                    }
+
                     Spacer()
-                    
-                    MultiTouchKeyButton(
-                        icon: "checkmark", label: "ONAY / ATLA",
-                        dikCode: UInt8(NFSU2_DIK_RETURN), tintColor: .mint,
-                        size: topBtnSize
-                    ).accessibilityLabel("Onay veya atla, Enter")
-                    MultiTouchKeyButton(
-                        icon: "arrow.uturn.backward", label: "GERİ",
-                        dikCode: UInt8(NFSU2_DIK_BACK), tintColor: .white,
-                        size: topBtnSize
-                    ).accessibilityLabel("Geri, Backspace")
-                    
-                    // Duraklat / Menü (ESC)
-                    MultiTouchKeyButton(
-                        icon: "pause.fill",
-                        label: "ESC",
-                        dikCode: UInt8(NFSU2_DIK_ESCAPE),
-                        tintColor: .yellow,
-                        size: topBtnSize
-                    )
+
+                    if showTopButtons {
+                        MultiTouchKeyButton(
+                            icon: "checkmark", label: "ONAY / ATLA",
+                            dikCode: UInt8(NFSU2_DIK_RETURN), tintColor: .mint,
+                            size: topBtnSize
+                        ).accessibilityLabel("Onay veya atla, Enter")
+                        MultiTouchKeyButton(
+                            icon: "arrow.uturn.backward", label: "GERİ",
+                            dikCode: UInt8(NFSU2_DIK_BACK), tintColor: .white,
+                            size: topBtnSize
+                        ).accessibilityLabel("Geri, Backspace")
+                    }
+
+                    if showTopButtons || showControls {
+                        // Duraklat / Menü (ESC)
+                        MultiTouchKeyButton(
+                            icon: "pause.fill",
+                            label: "ESC",
+                            dikCode: UInt8(NFSU2_DIK_ESCAPE),
+                            tintColor: .yellow,
+                            size: topBtnSize
+                        )
+                    }
                     Button(action: openSettings) {
                         Image(systemName: "gearshape.fill")
                             .frame(width: 44, height: 44)
@@ -711,6 +718,7 @@ public final class NFSU2MetalRenderUIView: UIView {
     
     @objc private func renderTick() {
         _ = metal_render_frame()
+        GameControllerManager.shared.pollRumbleTick()
     }
     
     deinit {
@@ -941,6 +949,7 @@ public struct GameMetalView: View {
     @AppStorage("controls.touchMode") private var touchMode = 0
     @AppStorage("controls.useSlider") private var useSlider = true
     @AppStorage("controls.manualGears") private var manualGears = false
+    @AppStorage("controls.showTopButtons") private var showTopButtons = false
     @State private var showSettings = false
     @State private var touchGeneration = UUID()
 #if NFS_FULL_RUNTIME
@@ -997,9 +1006,11 @@ public struct GameMetalView: View {
     private var settingsPanel: some View {
 #if NFS_FULL_RUNTIME
         GameSettingsPanel(touchMode: $touchMode, useSlider: $useSlider, manualGears: $manualGears,
+                          showTopButtons: $showTopButtons,
                           runtimeStatus: sessionStatus, runtimeLogURL: runtimeLogURL)
 #else
         GameSettingsPanel(touchMode: $touchMode, useSlider: $useSlider, manualGears: $manualGears,
+                          showTopButtons: $showTopButtons,
                           runtimeStatus: "Önizleme", runtimeLogURL: nil)
 #endif
     }

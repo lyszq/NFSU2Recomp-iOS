@@ -60,6 +60,14 @@ extern bool nfsu2_input_take_event_overflow(void);
 #define COM_HAS_INPUT_EVENT_QUEUE 0
 #endif
 
+#if defined(__APPLE__) && (TARGET_OS_IOS || TARGET_OS_SIMULATOR)
+extern void nfsu2_input_trigger_impact(float intensity, float sharpness, uint32_t duration_ms);
+#else
+static inline void nfsu2_input_trigger_impact(float intensity, float sharpness, uint32_t duration_ms){
+    (void)intensity; (void)sharpness; (void)duration_ms;
+}
+#endif
+
 /* COM dagitimi metot ADINI karsilastiriyor: kosuda 144 MILYON com_call var
  * ve her biri if-else zincirinde onlarca strcmp yapiyordu (profilde
  * strcmp+_platform_strcmp konuk thread'in %3.6'si, com_call kendisi %9.3).
@@ -110,6 +118,14 @@ static uint32_t gbuf_alloc(uint32_t n){
     return p;
 }
 
+static const Method M_DIEFFECT[] = {
+    {"QueryInterface", 3}, {"AddRef", 1}, {"Release", 1},
+    {"Initialize", 4}, {"GetEffectGuid", 2}, {"GetParameters", 3},
+    {"SetParameters", 3}, {"Start", 3}, {"Stop", 1},
+    {"GetEffectStatus", 2}, {"Download", 1}, {"Unload", 1},
+    {"Escape", 2},
+};
+
 typedef struct { const char *name; const Method *m; unsigned n; } Iface;
 static const Iface g_if[] = {
     {"?",              0,         0},
@@ -129,10 +145,11 @@ static const Iface g_if[] = {
     {"IDirectInputDevice8",      M_DIDEV,      NEL(M_DIDEV)},
     {"IDirectSound",             M_DS,         NEL(M_DS)},
     {"IDirectSoundBuffer",       M_DSBUF,      NEL(M_DSBUF)},
+    {"IDirectInputEffect",       M_DIEFFECT,   NEL(M_DIEFFECT)},
 };
 enum { IF_D3D9=1, IF_DEV, IF_TEX, IF_VB, IF_IB, IF_SURF, IF_SIMPLE,
        IF_VSHADER, IF_VDECL, IF_STATEBLOCK, IF_SWAPCHAIN, IF_QUERY,
-       IF_DI8, IF_DIDEV, IF_DS, IF_DSBUF };
+       IF_DI8, IF_DIDEV, IF_DS, IF_DSBUF, IF_DIEFFECT };
 
 /* Guest execution serializes this bounded host registry. Keep multiple locks
  * per object, including identical/overlapping and out-of-order unlocks, without
@@ -4553,8 +4570,37 @@ int com_call(CPU *c, uint32_t magic){
             uint32_t p=A(c,nargs-1);
             if(p && p<0xE0000000u){ mem_commit(p,32); memset(g_mem+p,0,32); }
             r=0; }
+        else if (NMEQ(nm, "CreateEffect") || m == 18){
+            uint32_t pp = A(c, 3);
+            if (pp){
+                uint32_t eff = com_new(IF_DIEFFECT, 64);
+                MR32(pp) = eff;
+            }
+            r = 0;
+        }
         else r=0;
         if (di_tr) fprintf(stderr, " -> 0x%08x\n", r);
+    }
+    else if (iface==IF_DIEFFECT){
+        switch (m){
+        case 6: /* SetParameters */
+        case 7: /* Start */
+#if defined(__APPLE__) && (TARGET_OS_IOS || TARGET_OS_SIMULATOR)
+            nfsu2_input_trigger_impact(0.65f, 0.60f, 120u);
+#endif
+            r = 0;
+            break;
+        case 9: /* GetEffectStatus */
+            {
+                uint32_t pflags = A(c, 1);
+                if (pflags && mem_is_committed(pflags + 3)) MR32(pflags) = 0;
+                r = 0;
+            }
+            break;
+        default:
+            r = 0;
+            break;
+        }
     }
     else if (iface==IF_QUERY){
         if      (MID(GetDevice)){ uint32_t p=A(c,1); if(p) MR32(p)=g_dev; r=0; }
@@ -4734,7 +4780,7 @@ void com_report(void){
     fprintf(stderr,"  --- DirectInput / DirectSound cagrilari ---\n");
     { int any=0;
       for (unsigned i=1;i<NEL(g_if) && i<MSTAT_IF;i++){
-        if (i!=IF_DI8 && i!=IF_DIDEV && i!=IF_DS && i!=IF_DSBUF && i!=IF_QUERY) continue;
+        if (i!=IF_DI8 && i!=IF_DIDEV && i!=IF_DIEFFECT && i!=IF_DS && i!=IF_DSBUF && i!=IF_QUERY) continue;
         for (unsigned j=0;j<g_if[i].n && j<MSTAT_M;j++)
             if (g_mstat[i][j]){ any=1;
                 fprintf(stderr,"    %-26s %-26s %llu\n",

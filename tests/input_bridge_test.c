@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include "../ios/NFSU2iOS/Native/NFSU2InputBridge.h"
 #include "guest_cursor.h"
 #include "guest_memory.h"
@@ -238,6 +239,179 @@ static void test_metal_fill_mouse_bridge(void) {
     printf("PASS: test_metal_fill_mouse_bridge\n");
 }
 
+static void test_rumble_initial_and_null_safety(void) {
+    nfsu2_input_clear_rumble();
+    assert(nfsu2_input_poll_rumble(NULL) == false);
+
+    NFSU2RumbleSnapshot snap;
+    memset(&snap, 0xFF, sizeof(snap));
+    bool active = nfsu2_input_poll_rumble(&snap);
+    assert(active == false);
+    assert(snap.continuous_intensity == 0.0f);
+    assert(snap.continuous_sharpness == 0.0f);
+    assert(snap.impact_intensity == 0.0f);
+    assert(snap.impact_sharpness == 0.0f);
+    assert(snap.impact_duration_ms == 0);
+
+    printf("PASS: test_rumble_initial_and_null_safety\n");
+}
+
+static void test_rumble_continuous_and_ttl(void) {
+    nfsu2_input_clear_rumble();
+
+    /* Raporla: %60 güç, %40 keskinlik */
+    nfsu2_input_report_rumble(0.6f, 0.4f);
+
+    NFSU2RumbleSnapshot snap;
+    /* TTL = 8 olduğu için 8 kez poll çağrısında aktif kalmalıdır */
+    for (int i = 0; i < 8; i++) {
+        bool active = nfsu2_input_poll_rumble(&snap);
+        assert(active == true);
+        assert(fabsf(snap.continuous_intensity - 0.6f) < 0.005f);
+        assert(fabsf(snap.continuous_sharpness - 0.4f) < 0.005f);
+        assert(snap.impact_intensity == 0.0f);
+    }
+
+    /* 9. poll çağrısında TTL 0'a düşmüş olmalı ve sönümlenmelidir */
+    bool active = nfsu2_input_poll_rumble(&snap);
+    assert(active == false);
+    assert(snap.continuous_intensity == 0.0f);
+
+    /* Clamp testi */
+    nfsu2_input_report_rumble(1.5f, -0.5f);
+    active = nfsu2_input_poll_rumble(&snap);
+    assert(active == true);
+    assert(fabsf(snap.continuous_intensity - 1.0f) < 0.005f);
+    assert(snap.continuous_sharpness == 0.0f);
+
+    /* 0.001f altındaki genlik hemen sıfırlanmalı ve TTL 0 olmalıdır */
+    nfsu2_input_report_rumble(0.0005f, 0.5f);
+    active = nfsu2_input_poll_rumble(&snap);
+    assert(active == false);
+    assert(snap.continuous_intensity == 0.0f);
+
+    printf("PASS: test_rumble_continuous_and_ttl\n");
+}
+
+static void test_rumble_impact_trigger_and_consumption(void) {
+    nfsu2_input_clear_rumble();
+
+    /* Geçerli darbe tetikle */
+    nfsu2_input_trigger_impact(0.85f, 0.65f, 150u);
+
+    NFSU2RumbleSnapshot snap;
+    bool active = nfsu2_input_poll_rumble(&snap);
+    assert(active == true);
+    assert(fabsf(snap.impact_intensity - 0.85f) < 0.005f);
+    assert(fabsf(snap.impact_sharpness - 0.65f) < 0.005f);
+    assert(snap.impact_duration_ms == 150u);
+    assert(snap.impact_id > 0);
+    uint32_t last_id = snap.impact_id;
+
+    /* İkinci poll çağrısında tüketilmiş olmalı (impact_intensity 0 döner, ID korunur) */
+    active = nfsu2_input_poll_rumble(&snap);
+    assert(active == false);
+    assert(snap.impact_intensity == 0.0f);
+    assert(snap.impact_duration_ms == 0);
+    assert(snap.impact_id == last_id);
+
+    /* Süre clamp testleri (60..280 ms) */
+    nfsu2_input_trigger_impact(0.5f, 0.5f, 20u); /* < 60 olamaz */
+    nfsu2_input_poll_rumble(&snap);
+    assert(snap.impact_duration_ms == 60u);
+
+    nfsu2_input_trigger_impact(0.5f, 0.5f, 500u); /* > 280 olamaz */
+    nfsu2_input_poll_rumble(&snap);
+    assert(snap.impact_duration_ms == 280u);
+
+    /* <= 0.01f darbe yok sayılır */
+    last_id = snap.impact_id;
+    nfsu2_input_trigger_impact(0.008f, 0.5f, 100u);
+    active = nfsu2_input_poll_rumble(&snap);
+    assert(active == false);
+    assert(snap.impact_id == last_id);
+
+    printf("PASS: test_rumble_impact_trigger_and_consumption\n");
+}
+
+static void test_rumble_impact_coalescing(void) {
+    nfsu2_input_clear_rumble();
+
+    /* İlk darbe */
+    nfsu2_input_trigger_impact(0.40f, 0.30f, 100u);
+
+    NFSU2RumbleSnapshot snap;
+    /* Henüz poll edilmedi (Swift tüketmedi). Daha zayıf bir darbe gönder */
+    nfsu2_input_trigger_impact(0.20f, 0.90f, 220u);
+
+    /* Tüketim öncesi daha güçlü bir darbe gönder (coalescing: güçlü olan ezmelidir) */
+    nfsu2_input_trigger_impact(0.75f, 0.60f, 180u);
+
+    bool active = nfsu2_input_poll_rumble(&snap);
+    assert(active == true);
+    assert(fabsf(snap.impact_intensity - 0.75f) < 0.005f);
+    assert(fabsf(snap.impact_sharpness - 0.60f) < 0.005f);
+    assert(snap.impact_duration_ms == 180u);
+
+    printf("PASS: test_rumble_impact_coalescing\n");
+}
+
+static void test_rumble_clear_and_disabled(void) {
+    nfsu2_input_clear_rumble();
+
+    /* Rumble aktif iken clear_rumble çağrısı */
+    nfsu2_input_report_rumble(0.9f, 0.8f);
+    nfsu2_input_trigger_impact(0.8f, 0.7f, 120u);
+    nfsu2_input_clear_rumble();
+
+    NFSU2RumbleSnapshot snap;
+    bool active = nfsu2_input_poll_rumble(&snap);
+    assert(active == false);
+    assert(snap.continuous_intensity == 0.0f);
+    assert(snap.impact_intensity == 0.0f);
+
+    /* Controller clear sırasında rumble da sıfırlanmalı */
+    nfsu2_input_report_rumble(0.9f, 0.8f);
+    nfsu2_input_clear_controller();
+    active = nfsu2_input_poll_rumble(&snap);
+    assert(active == false);
+    assert(snap.continuous_intensity == 0.0f);
+
+    /* input_set_enabled(false) durumu */
+    nfsu2_input_report_rumble(0.7f, 0.7f);
+    nfsu2_input_trigger_impact(0.8f, 0.8f, 100u);
+    nfsu2_input_set_enabled(false);
+
+    active = nfsu2_input_poll_rumble(&snap);
+    assert(active == false);
+    assert(snap.continuous_intensity == 0.0f);
+    assert(snap.impact_intensity == 0.0f);
+
+    /* Devre dışıyken gelen çağrılar yoksayılmalı */
+    nfsu2_input_report_rumble(0.9f, 0.9f);
+    nfsu2_input_trigger_impact(0.9f, 0.9f, 100u);
+    active = nfsu2_input_poll_rumble(&snap);
+    assert(active == false);
+
+    /* Yeniden aktif edildiğinde sıfırlanmış olmalı ve yeni girdiler kabul edilmeli */
+    nfsu2_input_set_enabled(true);
+    active = nfsu2_input_poll_rumble(&snap);
+    assert(active == false);
+
+    nfsu2_input_report_rumble(0.5f, 0.5f);
+    active = nfsu2_input_poll_rumble(&snap);
+    assert(active == true);
+
+    /* nfsu2_input_reset() testi */
+    nfsu2_input_reset();
+    active = nfsu2_input_poll_rumble(&snap);
+    assert(active == false);
+    assert(snap.continuous_intensity == 0.0f);
+    assert(snap.impact_intensity == 0.0f);
+
+    printf("PASS: test_rumble_clear_and_disabled\n");
+}
+
 int main(void) {
     printf("=== Running NFSU2InputBridge Tests ===\n");
     test_initial_and_clear();
@@ -249,6 +423,11 @@ int main(void) {
     test_cursor_bridge();
     test_cursor_snapshot_bridge();
     test_metal_fill_mouse_bridge();
+    test_rumble_initial_and_null_safety();
+    test_rumble_continuous_and_ttl();
+    test_rumble_impact_trigger_and_consumption();
+    test_rumble_impact_coalescing();
+    test_rumble_clear_and_disabled();
     printf("=== All NFSU2InputBridge Tests PASSED ===\n");
     return 0;
 }

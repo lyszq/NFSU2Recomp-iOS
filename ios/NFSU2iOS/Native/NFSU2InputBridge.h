@@ -120,6 +120,26 @@ void nfsu2_input_set_viewport(uint32_t viewport_w, uint32_t viewport_h,
                                uint32_t game_w, uint32_t game_h);
 
 /*
+ * Oyun İçi Titreşim (Rumble / Haptics) Köprüsü
+ * Oyun içi fizik/çarpışma kancasından Swift ControllerHaptics motoruna
+ * gerçek zamanlı titreşim verisi aktarır.
+ */
+typedef struct {
+    float continuous_intensity; /* 0.0f .. 1.0f */
+    float continuous_sharpness; /* 0.0f .. 1.0f */
+    float impact_intensity;     /* 0.0f .. 1.0f */
+    float impact_sharpness;     /* 0.0f .. 1.0f */
+    uint32_t impact_duration_ms;/* 60 .. 280 ms */
+    uint32_t impact_id;         /* monotonic counter incremented on each impact */
+} NFSU2RumbleSnapshot;
+
+void nfsu2_input_report_rumble(float continuous_intensity, float continuous_sharpness);
+void nfsu2_input_trigger_impact(float intensity, float sharpness, uint32_t duration_ms);
+void nfsu2_input_clear_rumble(void);
+bool nfsu2_input_poll_rumble(NFSU2RumbleSnapshot *snapshot);
+void nfsu2_input_reset(void);
+
+/*
  * runtime/com.c ile geriye dönük uyumluluk:
  * com.c metal_fill_keyboard() fonksiyonunu çağırır ve metal_available() sorgular.
  */

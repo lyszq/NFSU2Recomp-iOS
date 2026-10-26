@@ -81,8 +81,8 @@ def main():
     p.add_argument('--public-run',type=int,required=True)
     p.add_argument('--replay-run',type=int)
     p.add_argument('--replay-source')
-    p.add_argument('--version', default='0.27.0')
-    p.add_argument('--build', default='35')
+    p.add_argument('--version', default='0.27.1')
+    p.add_argument('--build', default='36')
     a=p.parse_args()
     client=GitHub('NFSU2Recomp-ios-private'); client.private()
     base='/repos/'+client.repository

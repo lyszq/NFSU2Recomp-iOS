@@ -70,7 +70,11 @@ struct ControllerPreferences: Codable {
 private final class ControllerHaptics {
     private let queue = DispatchQueue(label: "dev.lyszq.nfsu2.controller-haptics")
     private var engine: CHHapticEngine?
-    private var player: CHHapticPatternPlayer?
+    private var engineRunning = false
+    private var continuousPlayer: CHHapticAdvancedPatternPlayer?
+    private var continuousActive = false
+    private var lastContinuousIntensity: Float = -1.0
+    private var lastContinuousSharpness: Float = -1.0
     private var status: ((String, Bool) -> Void)?
 
     func attach(_ controller: GCController?, status: @escaping (String, Bool) -> Void) {
@@ -87,57 +91,207 @@ private final class ControllerHaptics {
                 return
             }
             self.engine = engine
+            self.engineRunning = false
             engine.isAutoShutdownEnabled = true
             engine.stoppedHandler = { [weak self, weak engine] _ in
                 guard let self else { return }
                 self.queue.async {
                     guard let engine, self.engine === engine else { return }
-                    self.player = nil
-                    // The next explicit pulse starts the engine again. Never replay a stale pulse.
+                    self.continuousPlayer = nil
+                    self.continuousActive = false
+                    self.engineRunning = false
+                    self.lastContinuousIntensity = -1.0
+                    self.lastContinuousSharpness = -1.0
                 }
             }
             engine.resetHandler = { [weak self, weak engine] in
                 guard let self else { return }
                 self.queue.async {
                     guard let engine, self.engine === engine else { return }
-                    self.player = nil
+                    self.continuousPlayer = nil
+                    self.continuousActive = false
+                    self.engineRunning = false
+                    self.lastContinuousIntensity = -1.0
+                    self.lastContinuousSharpness = -1.0
+                    do {
+                        try self.engine?.start()
+                        self.engineRunning = true
+                    } catch {
+                        self.engineRunning = false
+                    }
                 }
             }
             self.report("Kontrolcü titreşimi kullanılabilir")
         }
     }
 
-    func pulse(strength: Float) {
-        queue.async {
-            guard let engine = self.engine, strength > 0 else { return }
-            do {
-                try self.player?.stop(atTime: CHHapticTimeImmediate)
-                try engine.start()
-                let event = CHHapticEvent(eventType: .hapticContinuous, parameters: [
-                    CHHapticEventParameter(parameterID: .hapticIntensity, value: min(1, max(0, strength))),
-                    CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.35)
-                ], relativeTime: 0, duration: 0.16)
-                let player = try engine.makePlayer(with: CHHapticPattern(events: [event], parameters: []))
-                self.player = player
+    private func ensureRunningEngine() throws {
+        guard let engine = self.engine else {
+            throw NSError(domain: "dev.lyszq.nfsu2.haptics", code: -1, userInfo: [NSLocalizedDescriptionKey: "Haptic engine not initialized"])
+        }
+        if !engineRunning {
+            try engine.start()
+            engineRunning = true
+        }
+    }
+
+    func playImpact(intensity: Float, sharpness: Float, durationMs: UInt32, strength: Double) {
+        guard strength > 0.05, intensity > 0.01 else { return }
+        queue.async { [weak self] in
+            guard let self else { return }
+            let scaledIntensity = Float(min(max(Double(intensity) * strength, 0.18), 1.0))
+            let clampedSharpness = min(max(sharpness, 0.1), 1.0)
+            let durationSec = min(max(Double(durationMs) / 1000.0, 0.06), 0.30)
+
+            let transientEvent = CHHapticEvent(
+                eventType: .hapticTransient,
+                parameters: [
+                    CHHapticEventParameter(parameterID: .hapticIntensity, value: scaledIntensity),
+                    CHHapticEventParameter(parameterID: .hapticSharpness, value: clampedSharpness)
+                ],
+                relativeTime: 0
+            )
+
+            let continuousEvent = CHHapticEvent(
+                eventType: .hapticContinuous,
+                parameters: [
+                    CHHapticEventParameter(parameterID: .hapticIntensity, value: scaledIntensity * 0.85),
+                    CHHapticEventParameter(parameterID: .hapticSharpness, value: max(clampedSharpness * 0.7, 0.15))
+                ],
+                relativeTime: 0,
+                duration: durationSec
+            )
+
+            func playPattern(on engine: CHHapticEngine) throws {
+                let pattern = try CHHapticPattern(events: [transientEvent, continuousEvent], parameters: [])
+                let player = try engine.makePlayer(with: pattern)
                 try player.start(atTime: CHHapticTimeImmediate)
-                self.report("Kontrolcü titreşimi kullanılabilir")
+            }
+
+            do {
+                try self.ensureRunningEngine()
+                guard let engine = self.engine else { return }
+                try playPattern(on: engine)
             } catch {
-                self.report("Titreşim başlatılamadı: \(error.localizedDescription)")
+                self.engineRunning = false
+                do {
+                    try self.ensureRunningEngine()
+                    guard let engine = self.engine else { return }
+                    try playPattern(on: engine)
+                } catch {
+                    self.report("Darbe titreşimi çalınamadı: \(error.localizedDescription)")
+                }
             }
         }
     }
 
+    func playImpact(intensity: Float, sharpness: Float, durationMs: UInt32, strength: Float) {
+        playImpact(intensity: intensity, sharpness: sharpness, durationMs: durationMs, strength: Double(strength))
+    }
+
+    func updateContinuous(intensity: Float, sharpness: Float, strength: Double) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if intensity <= 0.01 || strength <= 0.05 {
+                if self.continuousActive {
+                    try? self.continuousPlayer?.stop(atTime: CHHapticTimeImmediate)
+                    self.continuousActive = false
+                    self.lastContinuousIntensity = -1.0
+                    self.lastContinuousSharpness = -1.0
+                }
+                return
+            }
+
+            let scaledIntensity = Float(min(max(Double(intensity) * strength, 0.08), 1.0))
+            let clampedSharpness = min(max(sharpness, 0.05), 1.0)
+
+            do {
+                try self.ensureRunningEngine()
+                guard let engine = self.engine else { return }
+
+                var justStarted = false
+                if self.continuousPlayer == nil {
+                    let event = CHHapticEvent(
+                        eventType: .hapticContinuous,
+                        parameters: [
+                            CHHapticEventParameter(parameterID: .hapticIntensity, value: 0.5),
+                            CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.5)
+                        ],
+                        relativeTime: 0,
+                        duration: 30.0
+                    )
+                    let pattern = try CHHapticPattern(events: [event], parameters: [])
+                    let advancedPlayer = try engine.makeAdvancedPlayer(with: pattern)
+                    advancedPlayer.loopEnabled = true
+                    self.continuousPlayer = advancedPlayer
+                }
+
+                guard let player = self.continuousPlayer else { return }
+
+                if !self.continuousActive {
+                    try player.start(atTime: CHHapticTimeImmediate)
+                    self.continuousActive = true
+                    justStarted = true
+                }
+
+                let intensityDiff = abs(scaledIntensity - self.lastContinuousIntensity)
+                let sharpnessDiff = abs(clampedSharpness - self.lastContinuousSharpness)
+                if justStarted || intensityDiff > 0.02 || sharpnessDiff > 0.02 {
+                    let intensityParam = CHHapticDynamicParameter(
+                        parameterID: .hapticIntensityControl,
+                        value: scaledIntensity,
+                        relativeTime: 0
+                    )
+                    let sharpnessParam = CHHapticDynamicParameter(
+                        parameterID: .hapticSharpnessControl,
+                        value: clampedSharpness,
+                        relativeTime: 0
+                    )
+                    try player.sendParameters([intensityParam, sharpnessParam], atTime: CHHapticTimeImmediate)
+                    self.lastContinuousIntensity = scaledIntensity
+                    self.lastContinuousSharpness = clampedSharpness
+                }
+            } catch {
+                self.engineRunning = false
+                self.continuousPlayer = nil
+                self.continuousActive = false
+                self.lastContinuousIntensity = -1.0
+                self.lastContinuousSharpness = -1.0
+            }
+        }
+    }
+
+    func updateContinuous(intensity: Float, sharpness: Float, strength: Float) {
+        updateContinuous(intensity: intensity, sharpness: sharpness, strength: Double(strength))
+    }
+
+    func pulse(strength: Float) {
+        playImpact(intensity: 0.9, sharpness: 0.65, durationMs: 160, strength: Double(strength))
+    }
+
     func stop() {
         queue.async {
-            try? self.player?.stop(atTime: CHHapticTimeImmediate)
-            self.player = nil
+            if let player = self.continuousPlayer {
+                try? player.stop(atTime: CHHapticTimeImmediate)
+                self.continuousPlayer = nil
+            }
+            self.continuousActive = false
+            self.lastContinuousIntensity = -1.0
+            self.lastContinuousSharpness = -1.0
+            self.engineRunning = false
             self.engine?.stop(completionHandler: nil)
         }
     }
 
     private func releaseEngine() {
-        try? player?.stop(atTime: CHHapticTimeImmediate)
-        player = nil
+        if let player = continuousPlayer {
+            try? player.stop(atTime: CHHapticTimeImmediate)
+            continuousPlayer = nil
+        }
+        continuousActive = false
+        engineRunning = false
+        lastContinuousIntensity = -1.0
+        lastContinuousSharpness = -1.0
         engine?.stoppedHandler = { _ in }
         engine?.resetHandler = {}
         engine?.stop(completionHandler: nil)
@@ -165,7 +319,7 @@ public final class GameControllerManager: ObservableObject {
             }
             releaseInput()
             armNeutralGate()
-            if !preferences.vibration || !preferences.inputFeedback { haptics.stop() }
+            if !preferences.vibration { haptics.stop() }
             sample()
         }
     }
@@ -174,6 +328,7 @@ public final class GameControllerManager: ObservableObject {
     private var suppressedKeys = Set<UInt8>()
     private var menuOpen = false
     private var active = false
+    private var lastImpactId: UInt32 = 0
     private let haptics = ControllerHaptics()
     private var observers: [NSObjectProtocol] = []
     private var batteryTimer: Timer?
@@ -242,6 +397,35 @@ public final class GameControllerManager: ObservableObject {
     func tryVibration() {
         guard supportsControllerHaptics, preferences.vibration else { return }
         haptics.pulse(strength: preferences.vibrationStrength)
+    }
+
+    public func pollRumbleTick() {
+        var snapshot = NFSU2RumbleSnapshot()
+        _ = nfsu2_input_poll_rumble(&snapshot)
+
+        let isActive = self.active && !self.menuOpen
+        let hasConnectedController = self.isControllerConnected && self.controller != nil
+        let hapticsAvailable = self.supportsControllerHaptics
+
+        if isActive && preferences.vibration && hasConnectedController && hapticsAvailable {
+            if snapshot.impact_id != lastImpactId && snapshot.impact_intensity > 0.01 {
+                lastImpactId = snapshot.impact_id
+                haptics.playImpact(
+                    intensity: snapshot.impact_intensity,
+                    sharpness: snapshot.impact_sharpness,
+                    durationMs: snapshot.impact_duration_ms,
+                    strength: preferences.vibrationStrength
+                )
+            }
+            haptics.updateContinuous(
+                intensity: snapshot.continuous_intensity,
+                sharpness: snapshot.continuous_sharpness,
+                strength: preferences.vibrationStrength
+            )
+        } else {
+            lastImpactId = snapshot.impact_id
+            haptics.updateContinuous(intensity: 0, sharpness: 0, strength: 0)
+        }
     }
 
     private func refreshBattery() {
@@ -320,6 +504,7 @@ struct GameSettingsPanel: View {
     @Binding var touchMode: Int
     @Binding var useSlider: Bool
     @Binding var manualGears: Bool
+    @Binding var showTopButtons: Bool
     let runtimeStatus: String
     let runtimeLogURL: URL?
 
@@ -341,6 +526,7 @@ struct GameSettingsPanel: View {
                     }
                     Toggle("Direksiyon kaydırıcısı", isOn: $useSlider)
                     Toggle("Manuel vites düğmeleri", isOn: $manualGears)
+                    Toggle("Üst kısayol tuşlarını göster", isOn: $showTopButtons)
                 }
                 Section("Kontrolcü") {
                     Text(controller.connectedControllerName ?? "Kontrolcü bağlı değil")
@@ -386,7 +572,7 @@ struct GameSettingsPanel: View {
                     Text("Şiddet: %\(Int((controller.preferences.vibrationStrength * 100).rounded()))")
                     Button("Kontrolcüde kısa titreşim dene") { controller.tryVibration() }
                         .disabled(!controller.supportsControllerHaptics || !controller.preferences.vibration)
-                    Text("Bu seçenek tuş geri bildirimidir. Çarpışma, yol ve motor titreşimi henüz bağlı değil.")
+                    Text("Çarpışma darbeleri, duvar sürtmesi, yol yüzeyi, lastik kayması ve tuş geri bildirim titreşimlerini kontrol eder.")
                         .font(.footnote).foregroundStyle(.secondary)
                     Button("Kontrolcü ayarlarını varsayılana döndür") { controller.preferences = ControllerPreferences() }
                 }
